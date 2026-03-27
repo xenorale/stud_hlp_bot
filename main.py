@@ -1,7 +1,9 @@
 import asyncio
+import html
 import json
 import logging
 import os
+from typing import Optional
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import StateFilter, Command
@@ -16,7 +18,11 @@ from utils.calculators import (
     grade_by_percentage,
 )
 from utils.brs_helpers import get_brs_data, group_by_semester
-from database.db import init_db
+from utils.schedule_parser import (
+    parse_group_schedule, fetch_sheet_rows, get_available_groups,
+    format_lesson_for_subgroup, group_by_day, has_subgroups, DAYS_ORDER, Lesson,
+)
+from database.db import init_db, get_user_profile, save_user_profile
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -42,8 +48,21 @@ dp = Dispatcher()
 BRS_CACHE = {"data": None, "timestamp": None}
 CACHE_TTL = 3600  # 1 час
 
+# Кэш расписания: ключ = "course_group", обновляется раз в сутки
+SCHEDULE_CACHE: dict = {}   # {"3_10": {"data": [...], "timestamp": ...}}
+SCHEDULE_TTL = 86400  # 24 часа
+
+# Кэш доступных групп из таблицы (курс→[группы])
+GROUPS_CACHE: dict = {"data": None, "timestamp": None}
+
 
 # ============ FSM STATES ============
+
+class ProfileSetup(StatesGroup):
+    choosing_course = State()
+    choosing_group = State()
+    choosing_subgroup = State()
+
 
 class CalcAttendance(StatesGroup):
     selecting_subject = State()
@@ -59,29 +78,173 @@ class SetReminder(StatesGroup):
 # ============ ГЛАВНОЕ МЕНЮ ============
 
 def get_main_keyboard():
-    """Создает главное меню"""
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📚 Оценки из БРС", callback_data="brs_grades")],
         [InlineKeyboardButton(text="📅 Расписание", callback_data="schedule")],
         [InlineKeyboardButton(text="🧮 Влияние пропусков", callback_data="calc_attendance")],
         [InlineKeyboardButton(text="⏰ Напоминание", callback_data="reminder")],
         [InlineKeyboardButton(text="❓ FAQ", callback_data="faq")],
+        [InlineKeyboardButton(text="⚙️ Профиль", callback_data="profile")],
     ])
-    return keyboard
 
 
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
-    """Команда /start"""
-    await message.answer(
-        "👋 Привет! Я помощник студента ВГУ.\n\n"
-        "Я умею:\n"
-        "✅ Показать твои оценки из БРС\n"
-        "✅ Показать расписание на неделю\n"
-        "✅ Посчитать как пропуски повлияют на посещаемость\n"
-        "✅ Установить напоминание о паре\n\n"
-        "Выбери что тебе нужно:",
-        reply_markup=get_main_keyboard()
+async def cmd_start(message: Message, state: FSMContext):
+    profile = await asyncio.to_thread(get_user_profile, message.from_user.id)
+    if profile:
+        subgroup_label = {0: "", 1: ", подгр. 1", 2: ", подгр. 2"}.get(profile.get("subgroup", 0), "")
+        await message.answer(
+            f"👋 Привет! {profile['course']} курс, {profile['group']} группа{subgroup_label}\n\n"
+            "Выбери что нужно:",
+            reply_markup=get_main_keyboard(),
+            parse_mode="HTML",
+        )
+    else:
+        await _start_profile_setup(message, state)
+
+
+# ============ ПРОФИЛЬ / НАСТРОЙКА ============
+
+async def _get_available_groups_cached() -> dict[int, list[int]]:
+    """Возвращает доступные курсы и группы из таблицы (кэш 24ч)."""
+    now = datetime.now().timestamp()
+    if GROUPS_CACHE["data"] and now - (GROUPS_CACHE["timestamp"] or 0) < SCHEDULE_TTL:
+        return GROUPS_CACHE["data"]
+    rows = await asyncio.to_thread(fetch_sheet_rows)
+    data = get_available_groups(rows)
+    GROUPS_CACHE["data"] = data
+    GROUPS_CACHE["timestamp"] = now
+    return data
+
+
+async def _start_profile_setup(target: Message, state: FSMContext):
+    """Запускает FSM выбора курса."""
+    await state.set_state(ProfileSetup.choosing_course)
+    buttons = [
+        [InlineKeyboardButton(text=f"{c} курс", callback_data=f"setup_course_{c}")]
+        for c in range(1, 6)
+    ]
+    await target.answer(
+        "👋 Привет! Я помощник студента ВГУ ФКН.\n\n"
+        "Давай настроим профиль. На каком курсе ты учишься?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@dp.callback_query(ProfileSetup.choosing_course, F.data.startswith("setup_course_"))
+async def setup_choose_course(callback: CallbackQuery, state: FSMContext):
+    course = int(callback.data.split("_")[2])
+    await callback.answer()
+    await state.update_data(course=course)
+    await state.set_state(ProfileSetup.choosing_group)
+
+    await callback.message.edit_text("⏳ Загружаю список групп...")
+    try:
+        available = await _get_available_groups_cached()
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Не удалось загрузить таблицу:\n{e}")
+        await state.clear()
+        return
+
+    groups = available.get(course, [])
+    if not groups:
+        await callback.message.edit_text(f"❌ Группы для {course} курса не найдены в таблице.")
+        await state.clear()
+        return
+
+    # Кнопки групп по 5 в ряд
+    rows = [groups[i:i+5] for i in range(0, len(groups), 5)]
+    buttons = [
+        [InlineKeyboardButton(text=str(g), callback_data=f"setup_group_{g}") for g in row]
+        for row in rows
+    ]
+    await callback.message.edit_text(
+        f"<b>{course} курс</b> — выбери группу:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(ProfileSetup.choosing_group, F.data.startswith("setup_group_"))
+async def setup_choose_group(callback: CallbackQuery, state: FSMContext):
+    group = int(callback.data.split("_")[2])
+    data = await state.get_data()
+    course = data["course"]
+    await callback.answer()
+    await state.update_data(group=group)
+    await state.set_state(ProfileSetup.choosing_subgroup)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="1️⃣ Подгруппа 1", callback_data="setup_subgroup_1"),
+            InlineKeyboardButton(text="2️⃣ Подгруппа 2", callback_data="setup_subgroup_2"),
+        ],
+        [InlineKeyboardButton(text="👥 Вся группа", callback_data="setup_subgroup_0")],
+    ])
+    await callback.message.edit_text(
+        f"<b>{course} курс, {group} группа</b>\n\n"
+        "Ты в какой подгруппе?",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(ProfileSetup.choosing_subgroup, F.data.startswith("setup_subgroup_"))
+async def setup_choose_subgroup(callback: CallbackQuery, state: FSMContext):
+    subgroup = int(callback.data.split("_")[2])
+    data = await state.get_data()
+    course = data["course"]
+    group = data["group"]
+    await callback.answer()
+    await state.clear()
+
+    await asyncio.to_thread(save_user_profile, callback.from_user.id, course, group, subgroup)
+
+    subgroup_label = {0: "вся группа", 1: "1 подгруппа", 2: "2 подгруппа"}.get(subgroup, "")
+    await callback.message.edit_text(
+        f"✅ Профиль сохранён!\n\n"
+        f"<b>{course} курс, {group} группа</b> — {subgroup_label}\n\n"
+        "Выбери что нужно:",
+        reply_markup=get_main_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data == "profile")
+async def show_profile(callback: CallbackQuery, state: FSMContext):
+    profile = await asyncio.to_thread(get_user_profile, callback.from_user.id)
+    if profile:
+        subgroup_label = {0: "вся группа", 1: "1 подгруппа", 2: "2 подгруппа"}.get(
+            profile.get("subgroup", 0), "не указана"
+        )
+        text = (
+            f"⚙️ <b>Профиль</b>\n\n"
+            f"📚 Курс: <b>{profile['course']}</b>\n"
+            f"👥 Группа: <b>{profile['group']}</b>\n"
+            f"🔢 Подгруппа: <b>{subgroup_label}</b>"
+        )
+    else:
+        text = "⚙️ Профиль не настроен"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить профиль", callback_data="profile_edit")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")],
+    ])
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "profile_edit")
+async def profile_edit(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(ProfileSetup.choosing_course)
+    buttons = [
+        [InlineKeyboardButton(text=f"{c} курс", callback_data=f"setup_course_{c}")]
+        for c in range(1, 6)
+    ]
+    await callback.message.edit_text(
+        "На каком курсе ты учишься?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
 
 
@@ -229,25 +392,235 @@ async def navigate_semester(callback: CallbackQuery, state: FSMContext):
 
 # ============ РАСПИСАНИЕ ============
 
-@dp.callback_query(F.data == "schedule")
-async def show_schedule(callback: CallbackQuery):
-    """Показать расписание"""
-    schedule_text = (
-        "📅 **Твое расписание на неделю:**\n\n"
-        "**Понедельник:**\n"
-        "9:00-10:30 - Базы данных (ауд. 350, очно, преп. Петров И.И.)\n"
-        "11:00-12:30 - Python (онлайн, преп. Сидоров А.А.)\n\n"
-        "**Вторник:**\n"
-        "10:00-11:30 - ООП (ауд. 401, очно, преп. Иванов В.В.)\n\n"
-        "**Среда:**\n"
-        "14:00-15:30 - Физика (ауд. 250, очно, преп. Волков П.П.)"
-    )
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏰ Напоминание", callback_data="reminder")],
+def _get_today_day() -> Optional[str]:
+    """Возвращает название сегодняшнего дня по-русски или None (воскресенье)."""
+    weekday = datetime.now().weekday()  # 0=Пн, 6=Вс
+    if weekday < len(DAYS_ORDER):
+        return DAYS_ORDER[weekday]
+    return None
+
+
+async def get_cached_schedule(course: int, group: int) -> list[Lesson]:
+    """Возвращает расписание для (курс, группа) с кэшем на 24 часа."""
+    key = f"{course}_{group}"
+    now = datetime.now().timestamp()
+    entry = SCHEDULE_CACHE.get(key)
+    if entry and now - entry["timestamp"] < SCHEDULE_TTL:
+        return entry["data"]
+
+    lessons = await asyncio.to_thread(parse_group_schedule, group, course)
+    SCHEDULE_CACHE[key] = {"data": lessons, "timestamp": now}
+    return lessons
+
+
+def _schedule_keyboard(week: str, active_day: str | None = None) -> InlineKeyboardMarkup:
+    """Клавиатура расписания: числитель/знаменатель + дни + Сегодня + Обновить."""
+    week_row = [
+        InlineKeyboardButton(
+            text="▶ Числитель" if week == "num" else "Числитель",
+            callback_data="sched_num",
+        ),
+        InlineKeyboardButton(
+            text="▶ Знаменатель" if week == "den" else "Знаменатель",
+            callback_data="sched_den",
+        ),
+    ]
+    short_days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб"]
+    day_buttons = []
+    for short, full in zip(short_days, DAYS_ORDER):
+        mark = "▶ " if full == active_day else ""
+        day_buttons.append(
+            InlineKeyboardButton(
+                text=f"{mark}{short}",
+                callback_data=f"sched_day_{week}_{full}",
+            )
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        week_row,
+        day_buttons[:3],
+        day_buttons[3:],
+        [
+            InlineKeyboardButton(text="📅 Сегодня", callback_data=f"sched_today_{week}"),
+            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"sched_refresh_{week}"),
+        ],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")],
     ])
-    await callback.message.edit_text(schedule_text, reply_markup=keyboard, parse_mode="Markdown")
+
+
+def _format_day_schedule(
+    lessons: list[Lesson], day: str, subgroup_num: int, week: str
+) -> str:
+    """Красиво форматирует расписание на день с учётом подгруппы и недели."""
+    day_lessons = [l for l in lessons if l.day == day]
+    week_label = "числитель" if week == "num" else "знаменатель"
+    header = f"📅 <b>{day}</b>  <i>({week_label})</i>"
+
+    if not day_lessons:
+        return f"{header}\n\nПар нет 🎉"
+
+    divider = "─" * 22
+    parts = [header]
+    for lesson in day_lessons:
+        formatted = format_lesson_for_subgroup(lesson, subgroup_num, week)
+        if not formatted:
+            continue
+        block = f"⏰ <b>{html.escape(lesson.time)}</b>\n{formatted}"
+        parts.append(block)
+
+    if len(parts) == 1:
+        parts.append("Пар нет 🎉")
+
+    return f"\n{divider}\n".join(parts)
+
+
+async def _get_profile_or_warn(callback: CallbackQuery) -> Optional[dict]:
+    profile = await asyncio.to_thread(get_user_profile, callback.from_user.id)
+    if not profile:
+        await callback.message.edit_text(
+            "⚙️ Сначала настрой профиль — укажи курс и группу.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⚙️ Настроить", callback_data="profile_edit")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")],
+            ]),
+        )
+        await callback.answer()
+    return profile
+
+
+@dp.callback_query(F.data == "schedule")
+async def show_schedule(callback: CallbackQuery):
+    """Показать расписание — открывает ближайший день с парами."""
     await callback.answer()
+
+    profile = await _get_profile_or_warn(callback)
+    if not profile:
+        return
+
+    await callback.message.edit_text("⏳ Загружаю расписание...")
+
+    try:
+        lessons = await get_cached_schedule(profile["course"], profile["group"])
+    except Exception as e:
+        await callback.message.edit_text(
+            f"❌ Не удалось загрузить расписание:\n{str(e)[:200]}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")]
+            ])
+        )
+        return
+
+    # Открываем сегодня если есть пары, иначе первый день с парами
+    today = _get_today_day()
+    days_with_lessons = [d for d in DAYS_ORDER if any(l.day == d for l in lessons)]
+    active_day = today if (today and today in days_with_lessons) else (days_with_lessons[0] if days_with_lessons else DAYS_ORDER[0])
+
+    week = "num"
+    subgroup = profile.get("subgroup", 0)
+    text = _format_day_schedule(lessons, active_day, subgroup, week)
+    await callback.message.edit_text(
+        text,
+        reply_markup=_schedule_keyboard(week, active_day),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.in_({"sched_num", "sched_den"}))
+async def switch_week(callback: CallbackQuery):
+    await callback.answer()
+    week = "num" if callback.data == "sched_num" else "den"
+    profile = await asyncio.to_thread(get_user_profile, callback.from_user.id)
+    if not profile:
+        return
+    try:
+        lessons = await get_cached_schedule(profile["course"], profile["group"])
+    except Exception as e:
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
+        return
+    msg_text = callback.message.text or ""
+    active_day = next((d for d in DAYS_ORDER if d in msg_text), DAYS_ORDER[0])
+    subgroup = profile.get("subgroup", 0)
+    await callback.message.edit_text(
+        _format_day_schedule(lessons, active_day, subgroup, week),
+        reply_markup=_schedule_keyboard(week, active_day),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("sched_day_"))
+async def show_day(callback: CallbackQuery):
+    await callback.answer()
+    # формат: sched_day_{week}_{day}
+    parts = callback.data.split("_", 3)
+    week, day = parts[2], parts[3]
+    profile = await asyncio.to_thread(get_user_profile, callback.from_user.id)
+    if not profile:
+        return
+    try:
+        lessons = await get_cached_schedule(profile["course"], profile["group"])
+    except Exception as e:
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
+        return
+    subgroup = profile.get("subgroup", 0)
+    await callback.message.edit_text(
+        _format_day_schedule(lessons, day, subgroup, week),
+        reply_markup=_schedule_keyboard(week, day),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("sched_today_"))
+async def show_today(callback: CallbackQuery):
+    await callback.answer()
+    week = callback.data.split("_")[2]
+    profile = await asyncio.to_thread(get_user_profile, callback.from_user.id)
+    if not profile:
+        return
+    today = _get_today_day()
+    if not today:
+        await callback.answer("Сегодня воскресенье — пар нет 🎉", show_alert=True)
+        return
+    try:
+        lessons = await get_cached_schedule(profile["course"], profile["group"])
+    except Exception as e:
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
+        return
+    subgroup = profile.get("subgroup", 0)
+    await callback.message.edit_text(
+        _format_day_schedule(lessons, today, subgroup, week),
+        reply_markup=_schedule_keyboard(week, today),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("sched_refresh_"))
+async def refresh_schedule(callback: CallbackQuery):
+    await callback.answer("🔄 Обновляю...")
+    week = callback.data.split("_")[2]
+    profile = await asyncio.to_thread(get_user_profile, callback.from_user.id)
+    if not profile:
+        return
+    SCHEDULE_CACHE.pop(f"{profile['course']}_{profile['group']}", None)
+    try:
+        lessons = await get_cached_schedule(profile["course"], profile["group"])
+    except Exception as e:
+        await callback.message.edit_text(
+            f"❌ Ошибка обновления:\n{str(e)[:200]}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")]
+            ])
+        )
+        return
+    msg_text = callback.message.text or ""
+    active_day = next((d for d in DAYS_ORDER if d in msg_text), None)
+    if not active_day:
+        active_day = _get_today_day() or DAYS_ORDER[0]
+    subgroup = profile.get("subgroup", 0)
+    await callback.message.edit_text(
+        _format_day_schedule(lessons, active_day, subgroup, week),
+        reply_markup=_schedule_keyboard(week, active_day),
+        parse_mode="HTML"
+    )
 
 
 # ============ КАЛЬКУЛЯТОР ПОСЕЩАЕМОСТИ ============
@@ -463,19 +836,46 @@ async def show_reminder(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "faq")
 async def show_faq(callback: CallbackQuery):
-    """Показать FAQ из data/faq.json"""
-    if FAQ_ITEMS:
-        lines = ["❓ **Часто задаваемые вопросы**\n"]
-        for item in FAQ_ITEMS:
-            lines.append(f"**{item['question']}**\n{item['answer']}")
-        faq_text = "\n\n".join(lines)
-    else:
-        faq_text = "❓ **FAQ**\n\nРаздел пуст. Добавь вопросы в data/faq.json."
+    """Показать список вопросов FAQ кнопками"""
+    if not FAQ_ITEMS:
+        await callback.message.edit_text(
+            "❓ FAQ пуст. Добавь вопросы в data/faq.json.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")],
+            ])
+        )
+        await callback.answer()
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=item["question"], callback_data=f"faq_{i}")]
+        for i, item in enumerate(FAQ_ITEMS)
+    ]
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")])
+
+    await callback.message.edit_text(
+        "❓ <b>Часто задаваемые вопросы</b>\n\nВыбери вопрос:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("faq_"))
+async def show_faq_answer(callback: CallbackQuery):
+    """Показать ответ на конкретный вопрос"""
+    idx = int(callback.data.split("_")[1])
+    if idx >= len(FAQ_ITEMS):
+        await callback.answer("❌ Вопрос не найден")
+        return
+
+    item = FAQ_ITEMS[idx]
+    text = f"❓ <b>{html.escape(item['question'])}</b>\n\n{html.escape(item['answer'])}"
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")],
+        [InlineKeyboardButton(text="⬅️ К вопросам", callback_data="faq")],
     ])
-    await callback.message.edit_text(faq_text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     await callback.answer()
 
 

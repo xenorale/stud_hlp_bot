@@ -11,8 +11,11 @@ class User(Base):
 
     id = Column(Integer, primary_key=True)
     telegram_id = Column(Integer, unique=True, nullable=False)
-    student_id = Column(String, nullable=True)  # ID в БРС
+    student_id = Column(String, nullable=True)   # ID в БРС
     name = Column(String, nullable=True)
+    course_number = Column(Integer, nullable=True)   # курс (1-5)
+    group_number = Column(Integer, nullable=True)    # группа (1-17)
+    subgroup_number = Column(Integer, nullable=True) # подгруппа (1, 2, или 0 = вся группа)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     # Relationships

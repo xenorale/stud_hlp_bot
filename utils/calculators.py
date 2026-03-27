@@ -22,29 +22,23 @@ def get_attendance_penalty(weighted_score: float) -> dict:
             'grade': '❓'
         }
 
-    # Штраф уже рассчитан БРС, просто интерпретируем
-    if weighted_score >= 0:
-        # Хорошая посещаемость — бонус или 0
-        if weighted_score >= 4:
-            grade = '✅'
-            desc = 'Отличная (100%)'
-        elif weighted_score >= 2:
-            grade = '✅'
-            desc = 'Хорошая (95-100%)'
-        else:
-            grade = '✅'
-            desc = 'Нормальная (85-95%)'
-    else:
-        # Штраф за плохую посещаемость
-        if weighted_score <= -3:
-            grade = '❌'
-            desc = 'Низкая (<60%)'
-        elif weighted_score <= -1.5:
-            grade = '⚠️'
-            desc = 'Средняя (60-75%)'
-        else:
-            grade = '⚠️'
-            desc = 'Слабая (75-85%)'
+    # Формула: weighted = pct * 0.1 - 10
+    # 90% → -1.0 | 70% → -3.0 | 60% → -4.0 | 50% → -5.0
+    if weighted_score >= -1:      # pct >= 90%
+        grade = '✅'
+        desc = 'Отличная (90–100%)'
+    elif weighted_score > -3:     # pct 71–89%
+        grade = '✅'
+        desc = 'Хорошая (71–89%)'
+    elif weighted_score > -4:     # pct 61–70%
+        grade = '⚠️'
+        desc = 'Средняя (61–70%)'
+    elif weighted_score >= -5:    # pct 50–60%
+        grade = '❌'
+        desc = 'Низкая (50–60%)'
+    else:                         # pct < 50%
+        grade = '❌'
+        desc = 'Критическая (<50%)'
 
     return {
         'penalty_points': weighted_score,
@@ -54,29 +48,38 @@ def get_attendance_penalty(weighted_score: float) -> dict:
 
 
 def simulate_attendance_change(
-    current_weighted,   # может быть None!
-    classes_attended: int,
-    total_classes: int,
-    skips: int
+    current_pct: float,  # текущая посещаемость из БРС (%)
+    classes_held: int,   # сколько пар уже прошло
+    future_total: int,   # сколько пар ещё будет
+    skips: int           # из будущих — планируешь пропустить
 ) -> dict:
-    # Если weighted_score = None, считаем от attendance_pct напрямую
-    if current_weighted is not None:
-        current_pct = max(0, min(100, (current_weighted + 0.5) / 0.1 + 85))
-    else:
-        # Нет данных о weighted — берём посещаемость как 100%
-        current_pct = 100.0
-        current_weighted = 0.0
+    """
+    Считает новую посещаемость после дополнительных пропусков.
 
-    new_attended = max(0, classes_attended - skips)
-    new_total = total_classes + skips
-    new_pct = (new_attended / new_total * 100) if new_total > 0 else 0
+    Формула БРС: weighted = pct * 0.1 - 10
+      (82.35% → -1.76, 91.3% → -0.87, 76.92% → -2.31)
 
-    new_weighted = round((new_pct - 85) * 0.1 - 0.5, 2)
+    Пример: 85% из 20 прошедших пар, впереди 30, пропустишь 3:
+      attended = int(0.85*20) + (30-3) = 17 + 27 = 44
+      total    = 20 + 30 = 50
+      new_pct  = 44/50*100 = 88%
+      new_weighted = 88 * 0.1 - 10 = -1.2
+    """
+    current_pct = max(0.0, min(100.0, current_pct))
+    current_weighted = round(current_pct * 0.1 - 10, 2)
+
+    attended_so_far = int(current_pct / 100 * classes_held)
+    future_attended = max(0, future_total - skips)
+    new_attended = attended_so_far + future_attended
+    total = classes_held + future_total
+
+    new_pct = round((new_attended / total * 100) if total > 0 else 0.0, 2)
+    new_weighted = round(new_pct * 0.1 - 10, 2)
     penalty = get_attendance_penalty(new_weighted)
 
     return {
         'current_pct': round(current_pct, 2),
-        'new_pct': round(new_pct, 2),
+        'new_pct': new_pct,
         'current_weighted': current_weighted,
         'new_weighted': new_weighted,
         'change': round(new_weighted - current_weighted, 2),

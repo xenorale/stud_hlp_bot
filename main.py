@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import os
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import StateFilter, Command
@@ -11,11 +13,27 @@ from config import BOT_TOKEN, BRS_USERNAME, BRS_PASSWORD, BRS_STUDENT_ID
 from utils.calculators import (
     get_attendance_penalty,
     simulate_attendance_change,
+    grade_by_percentage,
 )
 from utils.brs_helpers import get_brs_data, group_by_semester
+from database.db import init_db
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ============ FAQ ============
+
+_FAQ_PATH = os.path.join(os.path.dirname(__file__), "data", "faq.json")
+
+def _load_faq() -> list[dict]:
+    try:
+        with open(_FAQ_PATH, encoding="utf-8") as f:
+            return json.load(f).get("faq", [])
+    except FileNotFoundError:
+        logger.warning("data/faq.json не найден, FAQ будет пустым")
+        return []
+
+FAQ_ITEMS: list[dict] = _load_faq()
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -81,7 +99,7 @@ async def get_cached_brs_data():
 
     # Иначе загружаем новые данные
     logger.info("⏳ Загружаю БРС (не в кэше)...")
-    rows = get_brs_data(BRS_USERNAME, BRS_PASSWORD, BRS_STUDENT_ID)
+    rows = await asyncio.to_thread(get_brs_data, BRS_USERNAME, BRS_PASSWORD, BRS_STUDENT_ID)
 
     if rows:
         BRS_CACHE["data"] = rows
@@ -321,7 +339,6 @@ async def calc_future_skips(message: Message, state: FSMContext):
         future_skips = int(message.text)
         await state.update_data(future_skips=future_skips)
 
-        # ← ДОБАВИТЬ ЭТУ СТРОКУ!
         await state.set_state(CalcAttendance.waiting_for_future_total)
 
         await message.answer(
@@ -332,6 +349,39 @@ async def calc_future_skips(message: Message, state: FSMContext):
         )
     except ValueError:
         await message.answer("❌ Введи число, например: 2")
+
+
+def _build_attendance_result_text(row, future_skips: int, future_total: int, is_estimated: bool) -> str:
+    """Строит текст результата калькулятора посещаемости"""
+    current_pct = row.attendance_pct or 85.0
+
+    result = simulate_attendance_change(
+        current_pct=current_pct,
+        classes_held=20,
+        future_total=future_total,
+        skips=future_skips,
+    )
+
+    note = f"_(оставшихся пар: {future_total} — примерная оценка)_\n\n" if is_estimated else ""
+
+    return (
+        f"📊 **Результат для {row.subject}**\n\n"
+        f"{note}"
+        f"**Сейчас:**\n"
+        f"Посещаемость: {result['current_pct']}% ({grade_by_percentage(result['current_pct'])})\n"
+        f"Взвешенный балл: {result['current_weighted']}\n\n"
+        f"**После {future_skips} пропусков:**\n"
+        f"Посещаемость: {result['new_pct']}% ({grade_by_percentage(result['new_pct'])})\n"
+        f"Взвешенный балл: {result['new_weighted']}\n"
+        f"Изменение: {result['change']} баллов\n\n"
+        f"**Статус:** {result['description']} {result['grade']}"
+    )
+
+
+_CALC_RESULT_KEYBOARD = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="🔄 Еще раз", callback_data="calc_attendance")],
+    [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_menu")],
+])
 
 
 @dp.callback_query(StateFilter(CalcAttendance.waiting_for_future_total), F.data == "future_total_unknown")
@@ -353,39 +403,39 @@ async def future_total_unknown(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
-    future_total = 30  # дефолтное значение
+    result_text = _build_attendance_result_text(row, future_skips, future_total=30, is_estimated=True)
+    await callback.message.edit_text(result_text, reply_markup=_CALC_RESULT_KEYBOARD, parse_mode="Markdown")
+    await state.clear()
 
-    current_pct = row.attendance_pct or 85.0
-    estimated_attended = int(current_pct / 100 * 20)
 
-    result = simulate_attendance_change(
-        current_weighted=row.weighted_score,
-        classes_attended=estimated_attended,
-        total_classes=20 + future_total,
-        skips=future_skips
-    )
+@dp.message(CalcAttendance.waiting_for_future_total)
+async def calc_future_total(message: Message, state: FSMContext):
+    """Получить количество оставшихся пар от пользователя"""
+    try:
+        future_total = int(message.text)
+        if future_total <= 0:
+            await message.answer("❌ Введи положительное число, например: 15")
+            return
+    except ValueError:
+        await message.answer("❌ Введи число, например: 15")
+        return
 
-    penalty_info = get_attendance_penalty(result['new_weighted'])
+    data = await state.get_data()
+    row = data.get("selected_subject")
+    future_skips = data.get("future_skips")
 
-    result_text = (
-        f"📊 **Результат для {row.subject}**\n\n"
-        f"_(использовано примерное количество оставшихся пар: {future_total})_\n\n"
-        f"**Текущие показатели:**\n"
-        f"Посещаемость: {result['current_pct']}%\n"
-        f"Взвешенный балл: {result['current_weighted']}\n\n"
-        f"**После {future_skips} пропусков:**\n"
-        f"Посещаемость: {result['new_pct']}%\n"
-        f"Новый взвешенный балл: {result['new_weighted']}\n"
-        f"Изменение: {result['change']} баллов\n\n"
-        f"**Статус:** {penalty_info['description']} {penalty_info['grade']}"
-    )
+    if not row:
+        await message.answer(
+            "❌ Ошибка: предмет не выбран. Начни заново.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")],
+            ])
+        )
+        await state.clear()
+        return
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Еще раз", callback_data="calc_attendance")],
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_menu")],
-    ])
-
-    await callback.message.edit_text(result_text, reply_markup=keyboard, parse_mode="Markdown")
+    result_text = _build_attendance_result_text(row, future_skips, future_total, is_estimated=False)
+    await message.answer(result_text, reply_markup=_CALC_RESULT_KEYBOARD, parse_mode="Markdown")
     await state.clear()
 
 
@@ -413,19 +463,15 @@ async def show_reminder(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "faq")
 async def show_faq(callback: CallbackQuery):
-    """Показать FAQ"""
-    faq_text = (
-        "❓ **Часто задаваемые вопросы**\n\n"
-        "**Как добавить свои данные?**\n"
-        "Установи переменные в .env файл\n\n"
-        "**Почему не загружаются оценки?**\n"
-        "Проверь логин/пароль и ID студента\n\n"
-        "**Как считается взвешенный балл?**\n"
-        "`weighted = (attendance% - 85) * 0.1 - 0.5`\n"
-        "Пример: 82.35% → -1.76 баллов\n\n"
-        "**Влияет ли посещаемость на оценку?**\n"
-        "Да! Штраф от -5 до 0 баллов"
-    )
+    """Показать FAQ из data/faq.json"""
+    if FAQ_ITEMS:
+        lines = ["❓ **Часто задаваемые вопросы**\n"]
+        for item in FAQ_ITEMS:
+            lines.append(f"**{item['question']}**\n{item['answer']}")
+        faq_text = "\n\n".join(lines)
+    else:
+        faq_text = "❓ **FAQ**\n\nРаздел пуст. Добавь вопросы в data/faq.json."
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_menu")],
     ])
@@ -451,6 +497,8 @@ async def back_to_menu(callback: CallbackQuery, state: FSMContext):
 # ============ ЗАПУСК БОТА ============
 
 async def main():
+    init_db()
+    logger.info("✅ База данных инициализирована (bot.db)")
     logger.info("🤖 Бот запущен...")
     await dp.start_polling(bot)
 

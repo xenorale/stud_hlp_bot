@@ -30,6 +30,14 @@ class BrsRow:
     final_score: Optional[float]
     final_text: str
     moodle_url: Optional[str]
+    lessons_url: Optional[str] = None   # /brs/lessons_report_student/...
+
+
+@dataclass
+class LessonsStats:
+    total: int        # всего пар
+    attended: int     # посещено (+)
+    skipped: int      # пропущено (-)
 
 
 def _cell_text(cell) -> str:
@@ -174,6 +182,7 @@ def parse_brs_att_marks(html: str) -> List[BrsRow]:
             if att_a
             else _to_float(_cell_text(attendance_cell))
         )
+        lessons_url = att_a.get("href") if att_a else None
 
         weighted_score = _to_float(_cell_text(tds[10]))
         exam_score = _to_float(_cell_text(tds[11]))
@@ -199,10 +208,34 @@ def parse_brs_att_marks(html: str) -> List[BrsRow]:
                 final_score=final_score,
                 final_text=final_text,
                 moodle_url=moodle_url,
+                lessons_url=lessons_url,
             )
         )
 
     return result
+
+
+def fetch_lessons_stats(lessons_url: str, session: requests.Session) -> LessonsStats:
+    """Парсит страницу пар и возвращает статистику посещаемости."""
+    base = "https://www.cs.vsu.ru"
+    url = lessons_url if lessons_url.startswith("http") else base + lessons_url
+    resp = _safe_request(session, "GET", url)
+    soup = BeautifulSoup(resp.text, "lxml")
+    rows = soup.select("table tbody tr")
+    total = 0
+    attended = 0
+    skipped = 0
+    for tr in rows:
+        tds = tr.find_all("td")
+        if len(tds) < 7:
+            continue
+        total += 1
+        mark = _cell_text(tds[6]).strip()
+        if mark == "+":
+            attended += 1
+        elif mark == "-":
+            skipped += 1
+    return LessonsStats(total=total, attended=attended, skipped=skipped)
 
 
 def fetch_and_parse_brs(

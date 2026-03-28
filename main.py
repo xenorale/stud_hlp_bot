@@ -11,7 +11,7 @@ from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, C
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from config import BOT_TOKEN, BRS_USERNAME, BRS_PASSWORD, BRS_STUDENT_ID
+from config import BOT_TOKEN, BRS_USERNAME, BRS_PASSWORD, BRS_STUDENT_ID, WEBAPP_URL, API_PORT
 from utils.calculators import (
     get_attendance_penalty,
     simulate_attendance_change,
@@ -22,7 +22,7 @@ from utils.schedule_parser import (
     parse_group_schedule, fetch_sheet_rows, get_available_groups,
     format_lesson_for_subgroup, group_by_day, has_subgroups, DAYS_ORDER, Lesson,
 )
-from database.db import init_db, get_user_profile, save_user_profile
+from database.db import init_db, get_user_profile, save_user_profile, get_reminder_users
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -90,17 +90,31 @@ def get_main_keyboard():
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
-    profile = await asyncio.to_thread(get_user_profile, message.from_user.id)
-    if profile:
-        subgroup_label = {0: "", 1: ", подгр. 1", 2: ", подгр. 2"}.get(profile.get("subgroup", 0), "")
+    if WEBAPP_URL:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🎓 Открыть приложение",
+                web_app=types.WebAppInfo(url=WEBAPP_URL),
+            )],
+        ])
         await message.answer(
-            f"👋 Привет! {profile['course']} курс, {profile['group']} группа{subgroup_label}\n\n"
-            "Выбери что нужно:",
-            reply_markup=get_main_keyboard(),
-            parse_mode="HTML",
+            "👋 Привет! Я помощник студента ВГУ ФКН.\n\n"
+            "Нажми кнопку чтобы открыть приложение 👇",
+            reply_markup=keyboard,
         )
     else:
-        await _start_profile_setup(message, state)
+        # fallback — старый текстовый режим пока WEBAPP_URL не настроен
+        profile = await asyncio.to_thread(get_user_profile, message.from_user.id)
+        if profile:
+            subgroup_label = {0: "", 1: ", подгр. 1", 2: ", подгр. 2"}.get(profile.get("subgroup", 0), "")
+            await message.answer(
+                f"👋 Привет! {profile['course']} курс, {profile['group']} группа{subgroup_label}\n\n"
+                "Выбери что нужно:",
+                reply_markup=get_main_keyboard(),
+                parse_mode="HTML",
+            )
+        else:
+            await _start_profile_setup(message, state)
 
 
 # ============ ПРОФИЛЬ / НАСТРОЙКА ============
@@ -894,13 +908,109 @@ async def back_to_menu(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# ============ ЗАПУСК БОТА ============
+# ============ НАПОМИНАНИЯ (фоновый таск) ============
+
+def _detect_week_now() -> str:
+    """Определяет числитель/знаменатель по текущей дате."""
+    now = datetime.now()
+    year = now.year if now.month >= 9 else now.year - 1
+    sem_start = datetime(year, 9, 1)
+    monday = sem_start - timedelta(days=sem_start.weekday())
+    week_num = (now - monday).days // 7 + 1
+    return "num" if week_num % 2 == 1 else "den"
+
+
+def _parse_lesson_start(time_str: str) -> Optional[tuple]:
+    """Парсит '8.00-9.35' -> (8, 0)."""
+    try:
+        start = time_str.split("-")[0].strip()
+        sep = "." if "." in start else ":"
+        h, m = start.split(sep)
+        return int(h), int(m)
+    except Exception:
+        return None
+
+
+_reminder_sent: set = set()
+_reminder_last_day: str = ""
+
+
+async def reminder_loop():
+    global _reminder_sent, _reminder_last_day
+    while True:
+        await asyncio.sleep(30)
+        try:
+            now = datetime.now()
+            today_str = now.strftime("%Y-%m-%d")
+
+            if _reminder_last_day != today_str:
+                _reminder_sent.clear()
+                _reminder_last_day = today_str
+
+            weekday = now.weekday()
+            if weekday >= 6:
+                continue
+            today_day_name = DAYS_ORDER[weekday]
+
+            users = await asyncio.to_thread(get_reminder_users)
+            week = _detect_week_now()
+
+            for user in users:
+                tid = user["telegram_id"]
+                mins = user["minutes_before"]
+                try:
+                    lessons = await get_cached_schedule(user["course"], user["group"])
+                except Exception:
+                    continue
+
+                for lesson in lessons:
+                    if lesson.day != today_day_name:
+                        continue
+                    hm = _parse_lesson_start(lesson.time)
+                    if not hm:
+                        continue
+                    h, m = hm
+                    lesson_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                    delta = (lesson_dt - now).total_seconds() / 60
+                    key = (tid, today_str, lesson.time)
+                    if 0 <= delta <= mins + 1 and key not in _reminder_sent:
+                        _reminder_sent.add(key)
+                        text = format_lesson_for_subgroup(lesson, user["subgroup"], week)
+                        first_line = (text or "Пара").split("\n")[0].strip()
+                        try:
+                            await bot.send_message(
+                                tid,
+                                f"⏰ Через {mins} мин начинается пара!\n\n"
+                                f"📚 {html.escape(first_line)}\n"
+                                f"🕐 {lesson.time}",
+                                parse_mode="HTML",
+                            )
+                        except Exception as e:
+                            logger.warning(f"Reminder send {tid}: {e}")
+        except Exception as e:
+            logger.error(f"Reminder loop error: {e}")
+
+
+# ============ ЗАПУСК ============
 
 async def main():
+    import uvicorn
+    from api.server import app as fastapi_app
+
     init_db()
     logger.info("✅ База данных инициализирована (bot.db)")
+
+    config = uvicorn.Config(fastapi_app, host="0.0.0.0", port=API_PORT, log_level="warning")
+    server = uvicorn.Server(config)
+
+    logger.info(f"🌐 API сервер запускается на порту {API_PORT}")
     logger.info("🤖 Бот запущен...")
-    await dp.start_polling(bot)
+
+    await asyncio.gather(
+        server.serve(),
+        dp.start_polling(bot),
+        reminder_loop(),
+    )
 
 
 if __name__ == "__main__":

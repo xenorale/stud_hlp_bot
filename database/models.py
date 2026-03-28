@@ -65,3 +65,11 @@ class Reminder(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="reminders")
+
+
+class ReminderSettings(Base):
+    __tablename__ = "reminder_settings"
+
+    telegram_id = Column(Integer, primary_key=True)
+    enabled = Column(Boolean, default=False)
+    minutes_before = Column(Integer, default=15)

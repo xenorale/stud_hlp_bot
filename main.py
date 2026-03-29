@@ -462,30 +462,34 @@ def _schedule_keyboard(week: str, active_day: str | None = None) -> InlineKeyboa
     ])
 
 
+_LESSON_NUMS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"]
+
+
 def _format_day_schedule(
     lessons: list[Lesson], day: str, subgroup_num: int, week: str
 ) -> str:
     """Красиво форматирует расписание на день с учётом подгруппы и недели."""
     day_lessons = [l for l in lessons if l.day == day]
     week_label = "числитель" if week == "num" else "знаменатель"
-    header = f"📅 <b>{day}</b>  <i>({week_label})</i>"
+    header = f"📅 <b>{day}</b>  ·  <i>{week_label}</i>"
 
     if not day_lessons:
         return f"{header}\n\nПар нет 🎉"
 
-    divider = "─" * 22
     parts = [header]
+    n = 0
     for lesson in day_lessons:
         formatted = format_lesson_for_subgroup(lesson, subgroup_num, week)
         if not formatted:
             continue
-        block = f"⏰ <b>{html.escape(lesson.time)}</b>\n{formatted}"
-        parts.append(block)
+        num = _LESSON_NUMS[n] if n < len(_LESSON_NUMS) else f"{n + 1}."
+        n += 1
+        parts.append(f"{num} <code>{html.escape(lesson.time)}</code>\n{formatted}")
 
-    if len(parts) == 1:
+    if n == 0:
         parts.append("Пар нет 🎉")
 
-    return f"\n{divider}\n".join(parts)
+    return "\n\n".join(parts)
 
 
 async def _get_profile_or_warn(callback: CallbackQuery) -> Optional[dict]:

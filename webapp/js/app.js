@@ -90,23 +90,6 @@ function detectCurrentWeek() {
 
 function weekLabel(w) { return w === "num" ? "Числитель" : "Знаменатель"; }
 
-function getLessonType(text) {
-  const t = (text || "").toLowerCase();
-  if (/лек/.test(t))                       return "lec";
-  if (/лаб/.test(t))                       return "lab";
-  if (/пр\.|практ|практика/.test(t))       return "pr";
-  if (/сем\.|семин/.test(t))               return "sem";
-  return "other";
-}
-
-const TYPE_BADGE = {
-  lec:   ["badge-lec",  "Лекция"],
-  lab:   ["badge-lab",  "Лаб"],
-  pr:    ["badge-pr",   "Практика"],
-  sem:   ["badge-sem",  "Семинар"],
-  other: [null, null],
-};
-
 function getLessonText(lesson, subgroup, week) {
   if (subgroup === 1) return week === "num" ? lesson.sub1_num : lesson.sub1_den;
   if (subgroup === 2) return week === "num" ? lesson.sub2_num : lesson.sub2_den;
@@ -115,8 +98,27 @@ function getLessonText(lesson, subgroup, week) {
 
 function parseLesson(text) {
   if (!text?.trim()) return null;
-  const lines = text.split("\n").map(s => s.trim()).filter(Boolean);
-  return { name: lines[0], meta: lines.slice(1).join(" · ") };
+
+  const isOnline = /\(ДО\s*\)/i.test(text);
+
+  // Чистим (id=...) и (ДО), нормализуем пробелы
+  let clean = text
+    .replace(/\s*\(id=\d+\)\s*/g, " ")
+    .replace(/\(ДО\s*\)/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Извлекаем преподавателя
+  const teacherRe = /(доц\.|ст\.преп\.|преп\.|асс\.|проф\.)\s+(.+?)(?:\s+(\d+\S*))?\s*$/;
+  const m = clean.match(teacherRe);
+  let name = clean, teacher = "", room = "";
+  if (m) {
+    name    = clean.slice(0, m.index).trim();
+    teacher = `${m[1]} ${m[2].trim()}`;
+    room    = m[3]?.trim() || "";
+  }
+
+  return { name, teacher, room, isOnline };
 }
 
 // ─── Tasks (localStorage) ────────────────────────────────────────────────────
@@ -195,17 +197,30 @@ function renderLessonCard(lesson, subgroup, week) {
   const text = getLessonText(lesson, subgroup, week);
   const parsed = parseLesson(text);
   if (!parsed) return null;
-  const type = getLessonType(text);
-  const [badgeClass, badgeText] = TYPE_BADGE[type];
-  const badge = badgeClass ? `<span class="type-badge ${badgeClass}">${badgeText}</span>` : "";
+
+  const { name, teacher, room, isOnline } = parsed;
+  const cardType = isOnline ? "online" : (room ? "offline" : "other");
+
+  let badge = "";
+  if (isOnline) {
+    badge = `<span class="type-badge badge-online">💻 Онлайн</span>`;
+  } else if (room) {
+    badge = `<span class="type-badge badge-offline">🏫 ауд. ${escapeHtml(room)}</span>`;
+  }
+
+  const time = lesson.time.replace(/\s*-\s*/g, "–");
+  const teacherHtml = teacher ? `<span class="lesson-teacher">${escapeHtml(teacher)}</span>` : "";
+  const metaHtml = (badge || teacherHtml)
+    ? `<div class="lesson-meta">${badge}${teacherHtml}</div>` : "";
+
   return `
-    <div class="lesson-card ${type}">
+    <div class="lesson-card ${cardType}">
       <div class="lesson-color-line"></div>
       <div class="lesson-inner">
-        <div class="lesson-time">${lesson.time.replace("-","–")}</div>
+        <div class="lesson-time">${time}</div>
         <div class="lesson-body">
-          <div class="lesson-name">${escapeHtml(parsed.name)}</div>
-          ${parsed.meta || badge ? `<div class="lesson-meta">${badge}${escapeHtml(parsed.meta)}</div>` : ""}
+          <div class="lesson-name">${escapeHtml(name)}</div>
+          ${metaHtml}
         </div>
       </div>
     </div>`;

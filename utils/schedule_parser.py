@@ -4,7 +4,11 @@ import csv
 import html
 import io
 import re
-import requests
+import ssl
+import time
+import urllib.request
+import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import dataclass
 from typing import Optional
 
@@ -14,6 +18,13 @@ EXPORT_URL = (
     f"https://docs.google.com/spreadsheets/d/{SHEET_ID}"
     f"/export?format=csv&gid={SHEET_GID}"
 )
+XLSX_URL = (
+    f"https://docs.google.com/spreadsheets/d/{SHEET_ID}"
+    f"/export?format=xlsx&gid={SHEET_GID}"
+)
+
+_MERGE_CACHE: dict = {"merges": None, "ts": 0}
+_MERGE_TTL = 86400  # 24 часа
 
 DAYS_ORDER = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
 _TIME_RE = re.compile(r"^\d{1,2}:\d{2}")
@@ -57,11 +68,70 @@ class Lesson:
         return False
 
 
+def _col_to_idx(col_str: str) -> int:
+    """'A'->0, 'BU'->72"""
+    result = 0
+    for c in col_str:
+        result = result * 26 + (ord(c) - 64)
+    return result - 1
+
+
+def _parse_cell_ref(ref: str) -> tuple[int, int]:
+    """'BU60' -> (row=59, col=72) 0-indexed"""
+    m = re.match(r"([A-Z]+)(\d+)", ref)
+    return int(m.group(2)) - 1, _col_to_idx(m.group(1))
+
+
+def fetch_merge_ranges() -> list[tuple[int, int, int, int]]:
+    """Скачивает xlsx и возвращает список (min_row, max_row, min_col, max_col) 0-indexed."""
+    now = time.time()
+    if _MERGE_CACHE["merges"] is not None and now - _MERGE_CACHE["ts"] < _MERGE_TTL:
+        return _MERGE_CACHE["merges"]
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(XLSX_URL, context=ctx, timeout=30) as resp:
+        xlsx_data = resp.read()
+
+    with zipfile.ZipFile(io.BytesIO(xlsx_data)) as zf:
+        sheet_xml = zf.read("xl/worksheets/sheet1.xml")
+
+    root = ET.fromstring(sheet_xml)
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    merges: list[tuple[int, int, int, int]] = []
+    mc_elem = root.find(f"{{{ns}}}mergeCells")
+    if mc_elem is not None:
+        for mc in mc_elem:
+            ref = mc.get("ref", "")
+            if ":" not in ref:
+                continue
+            a, b = ref.split(":")
+            r1, c1 = _parse_cell_ref(a)
+            r2, c2 = _parse_cell_ref(b)
+            merges.append((min(r1, r2), max(r1, r2), min(c1, c2), max(c1, c2)))
+
+    _MERGE_CACHE["merges"] = merges
+    _MERGE_CACHE["ts"] = now
+    return merges
+
+
+def _same_merge(row: int, col_a: int, col_b: int,
+                merges: list[tuple[int, int, int, int]]) -> bool:
+    """True если (row, col_a) и (row, col_b) входят в одну объединённую область."""
+    for min_r, max_r, min_c, max_c in merges:
+        if min_r <= row <= max_r and min_c <= col_a <= max_c and min_c <= col_b <= max_c:
+            return True
+    return False
+
+
 def fetch_sheet_rows() -> list[list[str]]:
-    resp = requests.get(EXPORT_URL, timeout=30, allow_redirects=True)
-    resp.encoding = "utf-8"
-    resp.raise_for_status()
-    return list(csv.reader(io.StringIO(resp.text)))
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(EXPORT_URL, context=ctx, timeout=30) as resp:
+        text = resp.read().decode("utf-8")
+    return list(csv.reader(io.StringIO(text)))
 
 
 def _get_course_ranges(rows: list[list[str]]) -> dict[int, tuple[int, int]]:
@@ -102,6 +172,21 @@ def get_available_groups(rows: list[list[str]]) -> dict[int, list[int]]:
     return result
 
 
+def _find_subsection_start(rows: list[list[str]], col: int, course_num: int) -> int:
+    """
+    Возвращает начальную колонку подсекции (потока), в которой находится col.
+    В таблице один курс может делиться на несколько потоков — каждый начинается
+    с повторного заголовка 'N курс' в row[0].
+    """
+    row0 = rows[0]
+    starts = [
+        i for i, cell in enumerate(row0)
+        if _COURSE_RE.match(cell.strip()) and int(_COURSE_RE.match(cell.strip()).group(1)) == course_num
+        and i <= col
+    ]
+    return max(starts) if starts else col
+
+
 def _find_group_col(rows: list[list[str]], group_num: int, course_num: int) -> Optional[int]:
     """Ищет колонку 'N группа' внутри диапазона нужного курса."""
     course_ranges = _get_course_ranges(rows)
@@ -138,6 +223,10 @@ def parse_group_schedule(group_num: int, course_num: int) -> list[Lesson]:
     has_second_col = col + 1 < len(row1) and not row1[col + 1].strip()
     col2 = col + 1 if has_second_col else col
 
+    # Начало подсекции (потока) для данной группы
+    subsec_start = _find_subsection_start(rows, col, course_num)
+    merges = fetch_merge_ranges()
+
     lessons: list[Lesson] = []
     current_day = ""
     i = 2
@@ -165,6 +254,13 @@ def parse_group_schedule(group_num: int, course_num: int) -> list[Lesson]:
         sub1_num = row[col].strip() if col < len(row) else ""
         sub2_num = row[col2].strip() if col2 < len(row) else ""
 
+        # Потоковая пара: ячейка слита с началом подсекции — проверяем через merge info
+        if not sub1_num and not sub2_num and subsec_start < col:
+            potok = row[subsec_start].strip() if subsec_start < len(row) else ""
+            if potok and _same_merge(i, subsec_start, col, merges):
+                sub1_num = potok
+                sub2_num = potok
+
         # Знаменатель — следующая строка без времени и без нового дня
         sub1_den = ""
         sub2_den = ""
@@ -175,6 +271,12 @@ def parse_group_schedule(group_num: int, course_num: int) -> list[Lesson]:
             if not _TIME_RE.match(n_time) and n_day not in DAYS_ORDER:
                 sub1_den = nrow[col].strip() if col < len(nrow) else ""
                 sub2_den = nrow[col2].strip() if col2 < len(nrow) else ""
+                # Потоковый знаменатель
+                if not sub1_den and not sub2_den and subsec_start < col:
+                    potok_den = nrow[subsec_start].strip() if subsec_start < len(nrow) else ""
+                    if potok_den and _same_merge(i + 1, subsec_start, col, merges):
+                        sub1_den = potok_den
+                        sub2_den = potok_den
                 i += 1  # пропускаем строку знаменателя
 
         # Если знаменатель пустой — копируем числитель (пара каждую неделю)
@@ -206,20 +308,34 @@ def has_subgroups(lessons: list[Lesson]) -> bool:
     )
 
 
+_ID_RE = re.compile(r"\s*\(id=\d+\)\s*")
+_DO_RE = re.compile(r"\(ДО\s*\)", re.IGNORECASE)
+
+
 def _format_subject(subject: str) -> str:
     """Форматирует строку предмета в красивый HTML."""
     if not subject:
         return ""
-    m = _TEACHER_RE.search(subject)
+
+    is_online = bool(_DO_RE.search(subject))
+    mode_icon = "💻" if is_online else "🏫"
+
+    # Убираем (id=...) и (ДО), схлопываем пробелы
+    clean = _ID_RE.sub(" ", subject)
+    clean = _DO_RE.sub("", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+
+    m = _TEACHER_RE.search(clean)
     if m:
-        subj_name = subject[:m.start()].strip()
+        subj_name = re.sub(r"\s+", " ", clean[:m.start()]).strip()
         teacher = f"{m.group(1)} {m.group(2).strip()}"
         room = m.group(3).strip() if m.group(3) else ""
-        lines = [f"📖 <b>{html.escape(subj_name)}</b>", f"👨‍🏫 {html.escape(teacher)}"]
-        if room:
-            lines.append(f"🚪 ауд. {html.escape(room)}")
-        return "\n".join(lines)
-    return f"📖 <b>{html.escape(subject)}</b>"
+        teacher_line = f"👤 {html.escape(teacher)}"
+        if room and not is_online:
+            teacher_line += f" · ауд. {html.escape(room)}"
+        return f"{mode_icon} <b>{html.escape(subj_name)}</b>\n{teacher_line}"
+
+    return f"{mode_icon} <b>{html.escape(clean)}</b>"
 
 
 def format_lesson_for_subgroup(lesson: Lesson, subgroup_num: int, week: str) -> str:

@@ -3,9 +3,11 @@ import html
 import json
 import logging
 import os
+import psutil
 from typing import Optional
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import StateFilter, Command
 from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from aiogram.fsm.context import FSMContext
@@ -1018,5 +1020,17 @@ async def main():
     )
 
 
+def free_port(port: int):
+    import signal
+    for conn in psutil.net_connections(kind="inet"):
+        if conn.laddr.port == port and conn.status == "LISTEN":
+            try:
+                psutil.Process(conn.pid).terminate()
+                logger.info(f"🔪 Убит процесс {conn.pid}, занимавший порт {port}")
+            except Exception as e:
+                logger.warning(f"Не удалось завершить процесс {conn.pid}: {e}")
+
+
 if __name__ == "__main__":
+    free_port(int(os.environ.get("PORT", API_PORT)))
     asyncio.run(main())

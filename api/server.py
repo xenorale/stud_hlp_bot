@@ -126,7 +126,11 @@ async def api_get_schedule(course: int, group: int):
     if entry and now - entry["timestamp"] < SCHEDULE_TTL:
         return entry["data"]
 
-    lessons = await asyncio.to_thread(parse_group_schedule, group, course)
+    try:
+        lessons = await asyncio.to_thread(parse_group_schedule, group, course)
+    except ValueError as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=str(e))
     result = [
         {
             "day": l.day,

@@ -4,11 +4,15 @@ import csv
 import html
 import io
 import re
-import ssl
 import time
-import urllib.request
+import warnings
 import xml.etree.ElementTree as ET
 import zipfile
+
+
+
+import requests
+import urllib3
 from dataclasses import dataclass
 from typing import Optional
 
@@ -88,11 +92,11 @@ def fetch_merge_ranges() -> list[tuple[int, int, int, int]]:
     if _MERGE_CACHE["merges"] is not None and now - _MERGE_CACHE["ts"] < _MERGE_TTL:
         return _MERGE_CACHE["merges"]
 
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    with urllib.request.urlopen(XLSX_URL, context=ctx, timeout=30) as resp:
-        xlsx_data = resp.read()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+        resp = requests.get(XLSX_URL, verify=False, timeout=30)
+    resp.raise_for_status()
+    xlsx_data = resp.content
 
     with zipfile.ZipFile(io.BytesIO(xlsx_data)) as zf:
         sheet_xml = zf.read("xl/worksheets/sheet1.xml")
@@ -126,11 +130,11 @@ def _same_merge(row: int, col_a: int, col_b: int,
 
 
 def fetch_sheet_rows() -> list[list[str]]:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    with urllib.request.urlopen(EXPORT_URL, context=ctx, timeout=30) as resp:
-        text = resp.read().decode("utf-8")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+        resp = requests.get(EXPORT_URL, verify=False, timeout=30)
+    resp.raise_for_status()
+    text = resp.content.decode("utf-8")
     return list(csv.reader(io.StringIO(text)))
 
 

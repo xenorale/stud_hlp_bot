@@ -3,9 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, List
 
+import warnings
+
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 from requests import RequestException
+
+warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
 
 
 REQUEST_TIMEOUT = 25  # seconds
@@ -80,6 +85,7 @@ def brs_login(username: str, password: str) -> requests.Session:
     action=None => POST на тот же URL /brs/login
     """
     session = requests.Session()
+    session.verify = False
 
     base = "https://www.cs.vsu.ru"
     login_url = f"{base}/brs/login"

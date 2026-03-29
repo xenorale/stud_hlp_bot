@@ -835,7 +835,17 @@ async function selectSubgroup(s) {
 // ─── Boot ────────────────────────────────────────────────────────────────────
 async function boot() {
   if (userId) {
-    state.profile = await apiFetch(`/api/profile/${userId}`).catch(() => null);
+    try {
+      state.profile = await apiFetch(`/api/profile/${userId}`);
+    } catch(e) {
+      if (e.message === "Profile not found") {
+        state.profile = null; // реально не настроен
+      } else {
+        // сетевая ошибка / сервер только стартанул — ждём и пробуем ещё раз
+        await new Promise(r => setTimeout(r, 2000));
+        state.profile = await apiFetch(`/api/profile/${userId}`).catch(() => null);
+      }
+    }
   }
   currentPageName = null;
   goTo(state.profile ? "home" : "profile");

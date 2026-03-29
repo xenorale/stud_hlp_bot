@@ -1000,10 +1000,11 @@ async def main():
     init_db()
     logger.info("✅ База данных инициализирована (bot.db)")
 
-    config = uvicorn.Config(fastapi_app, host="0.0.0.0", port=API_PORT, log_level="warning")
+    port = int(os.environ.get("PORT", API_PORT))
+    config = uvicorn.Config(fastapi_app, host="0.0.0.0", port=port, log_level="warning")
     server = uvicorn.Server(config)
 
-    logger.info(f"🌐 API сервер запускается на порту {API_PORT}")
+    logger.info(f"🌐 API сервер запускается на порту {port}")
     logger.info("🤖 Бот запущен...")
 
     await asyncio.gather(

@@ -392,6 +392,12 @@ body {
   z-index: 1;
 }
 
+.lesson-card.current-lesson {
+  animation: slideUp 0.4s cubic-bezier(0.2, 0.8, 0.2, 1) both, pulseBorder 3s ease-in-out infinite;
+  border-top: 1px solid var(--btn);
+  background: linear-gradient(135deg, rgba(94,92,230,.15) 0%, transparent 60%), var(--g-shine), var(--g-fill) !important;
+}
+
 .lesson-color-line { width: 4px; flex-shrink: 0; position: relative; z-index: 2; }
 .lesson-inner      { flex: 1; padding: 12px 14px; display: flex; gap: 12px; position: relative; z-index: 2; }
 
@@ -551,23 +557,23 @@ body {
    SKELETON
 ════════════════════ */
 @keyframes shimmer {
-  0%   { background-position: -400px 0; }
-  100% { background-position:  400px 0; }
+  0%   { background-position: -1200px 0; }
+  100% { background-position:  1200px 0; }
 }
 .skeleton {
   background: linear-gradient(90deg,
-    rgba(255,255,255,.05) 25%,
-    rgba(255,255,255,.13) 50%,
-    rgba(255,255,255,.05) 75%
+    rgba(255,255,255,.03) 25%,
+    rgba(255,255,255,.08) 50%,
+    rgba(255,255,255,.03) 75%
   );
-  background-size: 800px 100%;
-  animation: shimmer 1.6s infinite linear;
+  background-size: 1200px 100%;
+  animation: shimmer 2s infinite linear;
   border-radius: 8px;
 }
 @media (prefers-color-scheme: light) {
   .skeleton {
-    background: linear-gradient(90deg, rgba(0,0,0,.04) 25%, rgba(0,0,0,.09) 50%, rgba(0,0,0,.04) 75%);
-    background-size: 800px 100%;
+    background: linear-gradient(90deg, rgba(0,0,0,.02) 25%, rgba(0,0,0,.06) 50%, rgba(0,0,0,.02) 75%);
+    background-size: 1200px 100%;
   }
 }
 .skel-card {
@@ -664,6 +670,33 @@ details summary::-webkit-details-marker { display: none; }
 .toggle::after {
   content: ''; position: absolute;
   top: 2px; left: 2px; width: 27px; height: 27px; border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 2px 8px rgba(0,0,0,.3), inset 0 1px 0 rgba(255,255,255,.8);
+  transition: transform .22s cubic-bezier(.4,0,.2,1);
+}
+.toggle.on::after { transform: translateX(20px); }
+
+/* ════════════════════
+   ЧИПЫ МИНУТ
+════════════════════ */
+.mins-chip {
+  flex: 1; text-align: center; padding: 10px 4px;
+  background: var(--g-shine), var(--g-fill);
+  -webkit-backdrop-filter: var(--bd-sm); backdrop-filter: var(--bd-sm);
+  border-top:    1px solid var(--g-rim);
+  border-left:   1px solid rgba(255,255,255,.12);
+  border-right:  1px solid var(--g-edge);
+  border-bottom: 1px solid var(--g-edge);
+  border-radius: 10px; cursor: pointer;
+  font-size: 13px; font-weight: 600; color: var(--hint);
+  box-shadow: var(--sh-sm);
+  transition: all .15s;
+}
+.mins-chip.active {
+  background: var(--btn) !important; color: #fff; border-color: transparent;
+  box-shadow: 0 4px 14px rgba(94,92,230,.4), inset 0 1px 0 rgba(255,255,255,.3);
+}
+ 50%;
   background: #fff;
   box-shadow: 0 2px 8px rgba(0,0,0,.3), inset 0 1px 0 rgba(255,255,255,.8);
   transition: transform .22s cubic-bezier(.4,0,.2,1);

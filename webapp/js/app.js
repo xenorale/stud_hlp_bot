@@ -195,11 +195,24 @@ function skelSubjectCards(n = 4) {
     </div>`).join("");
 }
 
-function renderLessonCard(lesson, subgroup, week) {
+function isLessonCurrent(lessonTime) {
+  try {
+    const [startStr, endStr] = lessonTime.split("-").map(s => s.trim());
+    const now = new Date();
+    const [startH, startM] = startStr.split(":").map(Number);
+    const [endH, endM]     = endStr.split(":").map(Number);
+    const start = new Date(now); start.setHours(startH, startM, 0);
+    const end   = new Date(now); end.setHours(endH, endM, 0);
+    return now >= start && now <= end;
+  } catch(e) { return false; }
+}
+
+function renderLessonCard(lesson, subgroup, week, isToday = false) {
   const text = getLessonText(lesson, subgroup, week);
   const parsed = parseLesson(text);
   if (!parsed) return null;
   const { name, teacher, room, isOnline } = parsed;
+  const isCurrent = isToday && isLessonCurrent(lesson.time);
   const cardType = isOnline ? "online" : (room ? "offline" : "other");
   let badge = "";
   if (isOnline) badge = `<span class="type-badge badge-online">💻 Онлайн</span>`;
@@ -208,7 +221,7 @@ function renderLessonCard(lesson, subgroup, week) {
   const teacherHtml = teacher ? `<span class="lesson-teacher">${escapeHtml(teacher)}</span>` : "";
   const metaHtml = (badge || teacherHtml) ? `<div class="lesson-meta">${badge}${teacherHtml}</div>` : "";
   return `
-    <div class="lesson-card ${cardType}">
+    <div class="lesson-card ${cardType} ${isCurrent ? 'current-lesson' : ''}">
       <div class="lesson-color-line"></div>
       <div class="lesson-inner">
         <div class="lesson-time">${time}</div>
@@ -253,6 +266,10 @@ function goTo(name) {
   if (name === "brs")      renderBrsPage();
   if (name === "calc")     renderCalcPage();
   if (name === "profile")  renderProfilePage();
+  
+  if (window.lucide) {
+    setTimeout(() => lucide.createIcons(), 20);
+  }
 }
 
 function renderHomePage() {
@@ -269,7 +286,7 @@ function renderHomePage() {
         <div class="home-date">${now.getDate()} ${MONTH_NAMES[now.getMonth()]}</div>
       </div>
       <div class="week-pill">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <i data-lucide="clock" style="width:14px;height:14px;margin-right:2px"></i>
         ${weekLabel(week)}
       </div>
     </div>`;
@@ -302,6 +319,7 @@ function renderHomePage() {
     loadSchedule().then(() => {
       const slot = document.getElementById("home-lessons");
       if (slot) slot.innerHTML = buildHomeLessons(today, week);
+      if (window.lucide) lucide.createIcons();
     }).catch(() => {
       const slot = document.getElementById("home-lessons");
       if (slot) slot.innerHTML = `<div class="home-no-lessons">Не удалось загрузить расписание</div>`;
@@ -316,6 +334,7 @@ function renderHomePage() {
       if (slot) slot.innerHTML = `<div class="home-no-lessons">Не удалось загрузить оценки: ${e.message}</div>`;
     });
   }
+  if (window.lucide) lucide.createIcons();
 }
 
 function buildHomeLessons(today, week) {
@@ -324,7 +343,7 @@ function buildHomeLessons(today, week) {
   const dayLessons = state.schedule.filter(l => l.day === today);
   let cards = ""; let count = 0;
   for (const l of dayLessons) {
-    const card = renderLessonCard(l, subgroup, week);
+    const card = renderLessonCard(l, subgroup, week, true);
     if (card) { cards += card; count++; }
   }
   return count ? cards : `<div class="home-no-lessons">Пар нет 🎉</div>`;
@@ -366,7 +385,10 @@ function renderSchedulePage() {
   if (!state.scheduleLoaded) {
     el.innerHTML = `<div class="page-header">Расписание</div>${skelLessonCards(4)}`;
   }
-  loadSchedule().then(() => renderScheduleView(el)).catch(e => {
+  loadSchedule().then(() => {
+    renderScheduleView(el);
+    if (window.lucide) lucide.createIcons();
+  }).catch(e => {
     el.innerHTML = `<div class="page-header">Расписание</div>
       <div class="empty-state"><div class="empty-icon">❌</div><div class="empty-text">${e.message}</div></div>`;
   });
@@ -397,7 +419,7 @@ function renderScheduleView(el) {
   const dayLessons = state.schedule.filter(l => l.day === state.currentDay);
   let lessonsHtml = ""; let count = 0;
   for (const l of dayLessons) {
-    const card = renderLessonCard(l, subgroup, week);
+    const card = renderLessonCard(l, subgroup, week, state.currentDay === today);
     if (card) { lessonsHtml += card; count++; }
   }
   if (!count) lessonsHtml = `<div class="no-lessons">Пар нет 🎉</div>`;
@@ -407,6 +429,7 @@ function renderScheduleView(el) {
     <div class="days-scroll">${daysHtml}</div>
     ${lessonsHtml}
     <button class="btn btn-secondary" onclick="refreshSchedule()" style="margin-top:8px">🔄 Обновить</button>`;
+  if (window.lucide) lucide.createIcons();
 }
 
 function switchWeek(w) { haptic("light"); state.currentWeek = w; renderScheduleView(document.getElementById("page-schedule")); }
@@ -429,7 +452,10 @@ function renderBrsPage() {
   const el = document.getElementById("page-brs");
   if (state.brsSetupMode) { renderBrsSetup(el); return; }
   if (!state.brsLoaded) el.innerHTML = `<div class="page-header">Оценки</div>${skelSubjectCards(5)}`;
-  loadBrs().then(() => renderBrsView(el)).catch(e => {
+  loadBrs().then(() => {
+    renderBrsView(el);
+    if (window.lucide) lucide.createIcons();
+  }).catch(e => {
     if (e.message.includes("BRS credentials not configured")) {
       state.brsSetupMode = true;
       renderBrsSetup(el);
@@ -438,6 +464,7 @@ function renderBrsPage() {
         <div class="empty-state"><div class="empty-icon">❌</div><div class="empty-text">${e.message}</div></div>
         <button class="btn" onclick="state.brsSetupMode=true;renderBrsPage()">Настроить БРС</button>`;
     }
+    if (window.lucide) lucide.createIcons();
   });
 }
 
@@ -462,6 +489,7 @@ function renderBrsSetup(el) {
     </div>
     <button class="btn" onclick="saveBrsCreds()">Сохранить и войти</button>
     ${state.brsLoaded ? `<button class="btn btn-secondary" style="margin-top:8px" onclick="state.brsSetupMode=false;renderBrsPage()">Назад</button>` : ''}`;
+  if (window.lucide) lucide.createIcons();
 }
 
 async function saveBrsCreds() {
@@ -495,6 +523,7 @@ function renderBrsView(el) {
     el.innerHTML = `<div class="page-header">Оценки</div>
       <div class="empty-state"><div class="empty-icon">📭</div><div class="empty-text">Нет данных</div></div>
       <button class="btn btn-secondary" onclick="state.brsSetupMode=true;renderBrsPage()">Изменить данные БРС</button>`;
+    if (window.lucide) lucide.createIcons();
     return;
   }
   const semTabs = semesters.map(s =>
@@ -528,6 +557,7 @@ function renderBrsView(el) {
     <div class="semester-tabs">${semTabs}</div>
     ${subjects}
     <button class="btn btn-secondary" style="margin-top:16px" onclick="state.brsSetupMode=true;renderBrsPage()">⚙️ Настройки БРС</button>`;
+  if (window.lucide) lucide.createIcons();
 }
 
 function switchSemester(s) { haptic("light"); state.currentSemester = s; renderBrsView(document.getElementById("page-brs")); }
@@ -536,7 +566,13 @@ function renderCalcPage() {
   const el = document.getElementById("page-calc");
   if (!state.brsLoaded) {
     el.innerHTML = `<div class="page-header">Калькулятор</div>${skelSubjectCards(3)}`;
-    loadBrs().then(() => renderCalcForm(el)).catch(() => renderCalcManual(el));
+    loadBrs().then(() => {
+      renderCalcForm(el);
+      if (window.lucide) lucide.createIcons();
+    }).catch(() => {
+      renderCalcManual(el);
+      if (window.lucide) lucide.createIcons();
+    });
     return;
   }
   renderCalcForm(el);
@@ -582,6 +618,7 @@ function renderCalcForm(el = document.getElementById("page-calc")) {
       <button class="btn" onclick="runCalc()">Рассчитать</button>
     </div>
     <div id="calc-result"></div>`;
+  if (window.lucide) lucide.createIcons();
 }
 
 function renderCalcManual(el = document.getElementById("page-calc")) {
@@ -610,6 +647,7 @@ function renderCalcManual(el = document.getElementById("page-calc")) {
     </div>
     <button class="btn" onclick="runCalcManual()">Рассчитать</button>
     <div id="calc-result"></div>`;
+  if (window.lucide) lucide.createIcons();
 }
 
 async function selectCalcSubject(i) {
@@ -675,6 +713,7 @@ function showCalcResult(res, subject, skips) {
         <span class="result-value">${res.grade} ${res.description}</span></div>
     </div>`;
   if (change < 0) haptic("warning");
+  if (window.lucide) lucide.createIcons();
 }
 
 const profileSetup = { step: null, course: null, group: null };
@@ -729,6 +768,7 @@ async function renderProfilePage() {
       <div class="empty-text">Профиль не настроен</div></div>
       <button class="btn" onclick="startProfileSetup()">Настроить</button>`;
   }
+  if (window.lucide) lucide.createIcons();
 }
 
 async function toggleReminder() {
@@ -826,6 +866,7 @@ function renderProfileSetup(el) {
       </div>
       <button class="btn btn-secondary" style="margin-top:4px" onclick="profileSetup.step='group';renderProfileSetup(document.getElementById('page-profile'))">← Назад</button>`;
   }
+  if (window.lucide) lucide.createIcons();
 }
 
 function selectCourse(c) { haptic("light"); profileSetup.course=c; profileSetup.step="group"; renderProfileSetup(document.getElementById("page-profile")); }
@@ -863,6 +904,7 @@ async function boot() {
   }
   currentPageName = null;
   goTo(state.profile ? "home" : "profile");
+  if (window.lucide) lucide.createIcons();
 }
 
 boot();

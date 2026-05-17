@@ -64,10 +64,16 @@ def start_tunnel():
         encoding="utf-8",
         errors="replace",
     )
+    
+    # Сразу запускаем чтение логов, чтобы не забить буфер PIPE
+    threading.Thread(target=drain, args=(proc.stdout,), daemon=True).start()
 
     # Ждём пока ngrok поднимется и получаем URL через локальный API
     url = None
-    for _ in range(40):
+    print("[launch] Ожидаю получения публичного URL от ngrok...")
+    for i in range(40):
+        if i % 10 == 0 and i > 0:
+            print(f"[launch] Прошло {i//2} сек, всё ещё жду...")
         time.sleep(0.5)
         try:
             with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=2) as r:
@@ -82,11 +88,11 @@ def start_tunnel():
             pass
 
     if url is None:
+        print("[launch] Ошибка: ngrok не предоставил URL за 20 секунд.")
         proc.terminate()
         return None, None
 
-    print(f"[ngrok] Туннель: {url}")
-    threading.Thread(target=drain, args=(proc.stdout,), daemon=True).start()
+    print(f"[ngrok] Туннель успешно поднят: {url}")
     return proc, url
 
 

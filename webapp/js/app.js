@@ -6,7 +6,6 @@ if (tg) { tg.ready(); tg.expand(); }
 const userId   = tg?.initDataUnsafe?.user?.id         || null;
 const userName = tg?.initDataUnsafe?.user?.first_name || null;
 
-// ─── State ───────────────────────────────────────────────────────────────────
 const state = {
   profile: null,
   schedule: [],
@@ -21,6 +20,7 @@ const state = {
   brsLoaded: false,
   faqLoaded: false,
   reminderSettings: { enabled: false, minutes_before: 15 },
+  brsSetupMode: false,
 };
 
 const DAYS_SHORT  = ["Пн","Вт","Ср","Чт","Пт","Сб"];
@@ -29,13 +29,15 @@ const MONTH_NAMES = ["января","февраля","марта","апреля"
                      "июля","августа","сентября","октября","ноября","декабря"];
 const DAY_NAMES   = ["Воскресенье","Понедельник","Вторник","Среда","Четверг","Пятница","Суббота"];
 
-// ─── Utils ───────────────────────────────────────────────────────────────────
 async function apiFetch(path, opts = {}) {
   opts.headers = { "ngrok-skip-browser-warning": "1", ...(opts.headers || {}) };
   const r = await fetch(API + path, opts);
   if (!r.ok) {
     const err = await r.json().catch(() => ({ detail: r.statusText }));
-    throw new Error(err.detail || r.statusText);
+    let msg = err.detail || r.statusText;
+    if (Array.isArray(msg)) msg = msg.map(m => m.msg || JSON.stringify(m)).join(", ");
+    else if (typeof msg === 'object') msg = JSON.stringify(msg);
+    throw new Error(String(msg));
   }
   return r.json();
 }
@@ -91,24 +93,28 @@ function detectCurrentWeek() {
 function weekLabel(w) { return w === "num" ? "Числитель" : "Знаменатель"; }
 
 function getLessonText(lesson, subgroup, week) {
-  if (subgroup === 1) return week === "num" ? lesson.sub1_num : lesson.sub1_den;
-  if (subgroup === 2) return week === "num" ? lesson.sub2_num : lesson.sub2_den;
-  return week === "num" ? lesson.sub1_num : lesson.sub1_den;
+  const s1 = week === "num" ? lesson.sub1_num : lesson.sub1_den;
+  const s2 = week === "num" ? lesson.sub2_num : lesson.sub2_den;
+  if (subgroup === 1) return s1;
+  if (subgroup === 2) return s2;
+  if (s1 === s2) return s1;
+  let res = "";
+  if (s1?.trim()) res += `<div class="sub-label">1 подгр:</div>${s1}`;
+  if (s2?.trim()) {
+    if (res) res += "<br>";
+    res += `<div class="sub-label">2 подгр:</div>${s2}`;
+  }
+  return res;
 }
 
 function parseLesson(text) {
   if (!text?.trim()) return null;
-
   const isOnline = /\(ДО\s*\)/i.test(text);
-
-  // Чистим (id=...) и (ДО), нормализуем пробелы
   let clean = text
     .replace(/\s*\(id=\d+\)\s*/g, " ")
     .replace(/\(ДО\s*\)/gi, "")
     .replace(/\s+/g, " ")
     .trim();
-
-  // Извлекаем преподавателя
   const teacherRe = /(доц\.|ст\.преп\.|преп\.|асс\.|проф\.)\s+(.+?)(?:\s+(\d+\S*))?\s*$/;
   const m = clean.match(teacherRe);
   let name = clean, teacher = "", room = "";
@@ -117,11 +123,9 @@ function parseLesson(text) {
     teacher = `${m[1]} ${m[2].trim()}`;
     room    = m[3]?.trim() || "";
   }
-
   return { name, teacher, room, isOnline };
 }
 
-// ─── Tasks (localStorage) ────────────────────────────────────────────────────
 function loadTasks() {
   try { return JSON.parse(localStorage.getItem("student_tasks") || "[]"); }
   catch { return []; }
@@ -169,7 +173,6 @@ function renderTaskList() {
     (tasks.length > LIMIT ? `<div style="font-size:12px;color:var(--hint);margin-top:6px">+${tasks.length - LIMIT} ещё</div>` : '');
 }
 
-// ─── Skeleton helpers ─────────────────────────────────────────────────────────
 function skelLessonCards(n = 3) {
   return Array.from({length: n}, () => `
     <div class="skel-card" style="display:flex;gap:10px;align-items:center">
@@ -192,27 +195,18 @@ function skelSubjectCards(n = 4) {
     </div>`).join("");
 }
 
-// ─── Render lesson card ───────────────────────────────────────────────────────
 function renderLessonCard(lesson, subgroup, week) {
   const text = getLessonText(lesson, subgroup, week);
   const parsed = parseLesson(text);
   if (!parsed) return null;
-
   const { name, teacher, room, isOnline } = parsed;
   const cardType = isOnline ? "online" : (room ? "offline" : "other");
-
   let badge = "";
-  if (isOnline) {
-    badge = `<span class="type-badge badge-online">💻 Онлайн</span>`;
-  } else if (room) {
-    badge = `<span class="type-badge badge-offline">🏫 ауд. ${escapeHtml(room)}</span>`;
-  }
-
+  if (isOnline) badge = `<span class="type-badge badge-online">💻 Онлайн</span>`;
+  else if (room) badge = `<span class="type-badge badge-offline">🏫 ауд. ${escapeHtml(room)}</span>`;
   const time = lesson.time.replace(/\s*-\s*/g, "–");
   const teacherHtml = teacher ? `<span class="lesson-teacher">${escapeHtml(teacher)}</span>` : "";
-  const metaHtml = (badge || teacherHtml)
-    ? `<div class="lesson-meta">${badge}${teacherHtml}</div>` : "";
-
+  const metaHtml = (badge || teacherHtml) ? `<div class="lesson-meta">${badge}${teacherHtml}</div>` : "";
   return `
     <div class="lesson-card ${cardType}">
       <div class="lesson-color-line"></div>
@@ -226,7 +220,6 @@ function renderLessonCard(lesson, subgroup, week) {
     </div>`;
 }
 
-// ─── Navigation ──────────────────────────────────────────────────────────────
 const PAGE_ORDER = ["home","schedule","brs","calc","profile"];
 let currentPageName = null;
 
@@ -262,17 +255,12 @@ function goTo(name) {
   if (name === "profile")  renderProfilePage();
 }
 
-// ─── HOME ─────────────────────────────────────────────────────────────────────
 function renderHomePage() {
   const el = document.getElementById("page-home");
   const today = todayDayFull();
   const week = state.currentWeek;
   const now = new Date();
-
-  const greetLine = userName
-    ? `<div class="home-greeting">Привет, ${escapeHtml(userName)} 👋</div>`
-    : "";
-
+  const greetLine = userName ? `<div class="home-greeting">Привет, ${escapeHtml(userName)} 👋</div>` : "";
   const header = `
     <div class="home-hero">
       <div class="home-date-block">
@@ -285,7 +273,6 @@ function renderHomePage() {
         ${weekLabel(week)}
       </div>
     </div>`;
-
   if (!state.profile) {
     el.innerHTML = header + `
       <div class="empty-state"><div class="empty-icon">⚙️</div>
@@ -293,7 +280,6 @@ function renderHomePage() {
       <button class="btn" onclick="goTo('profile')">Настроить профиль</button>`;
     return;
   }
-
   el.innerHTML = header +
     `<div class="home-section-title">Пары сегодня</div>
      <div id="home-lessons">${state.scheduleLoaded ? buildHomeLessons(today, week) : skelLessonCards(3)}</div>` +
@@ -311,9 +297,7 @@ function renderHomePage() {
     `<div style="margin-top:14px">
        <button class="btn btn-secondary" onclick="goTo('schedule')">Полное расписание →</button>
      </div>`;
-
   renderTaskList();
-
   if (!state.scheduleLoaded) {
     loadSchedule().then(() => {
       const slot = document.getElementById("home-lessons");
@@ -327,9 +311,9 @@ function renderHomePage() {
     loadBrs().then(() => {
       const slot = document.getElementById("home-brs");
       if (slot) slot.innerHTML = buildHomeBrs();
-    }).catch(() => {
+    }).catch(e => {
       const slot = document.getElementById("home-brs");
-      if (slot) slot.innerHTML = `<div class="home-no-lessons">Не удалось загрузить оценки</div>`;
+      if (slot) slot.innerHTML = `<div class="home-no-lessons">Не удалось загрузить оценки: ${e.message}</div>`;
     });
   }
 }
@@ -349,7 +333,7 @@ function buildHomeLessons(today, week) {
 function buildHomeBrs() {
   const latest = state.brs.filter(r => r.semester === state.currentSemester);
   const good = latest.filter(r => r.grade_icon?.includes("✅")).length;
-  const warn = latest.filter(r => r.grade_icon?.includes("⚠")).length;
+  const warn = latest.filter(r => r.grade_icon?.includes("⚠️")).length;
   const bad  = latest.filter(r => r.grade_icon?.includes("❌")).length;
   return `
     <div class="brs-summary-grid">
@@ -362,7 +346,6 @@ function buildHomeBrs() {
     </div>`;
 }
 
-// ─── SCHEDULE ────────────────────────────────────────────────────────────────
 async function loadSchedule(force = false) {
   if (!state.profile) return;
   if (!force && state.scheduleLoaded) return;
@@ -397,8 +380,7 @@ function renderScheduleView(el) {
     state.schedule.some(l => l.day === d && getLessonText(l, subgroup, week)?.trim())
   );
   if (!state.currentDay || !DAYS_FULL.includes(state.currentDay)) {
-    state.currentDay = (today && daysWithLessons.includes(today))
-      ? today : (daysWithLessons[0] ?? DAYS_FULL[0]);
+    state.currentDay = (today && daysWithLessons.includes(today)) ? today : (daysWithLessons[0] ?? DAYS_FULL[0]);
   }
   const weekTabsHtml = `
     <div class="week-tabs">
@@ -431,10 +413,10 @@ function switchWeek(w) { haptic("light"); state.currentWeek = w; renderScheduleV
 function switchDay(d)  { haptic("light"); state.currentDay = d;  renderScheduleView(document.getElementById("page-schedule")); }
 function refreshSchedule() { state.scheduleLoaded = false; state.schedule = []; renderSchedulePage(); }
 
-// ─── BRS ─────────────────────────────────────────────────────────────────────
 async function loadBrs(force = false) {
   if (!force && state.brsLoaded) return;
-  const data = await apiFetch("/api/brs");
+  if (!userId) throw new Error("Не удалось определить ID пользователя. Открой через бота.");
+  const data = await apiFetch(`/api/brs?telegram_id=${userId}`);
   state.brs = data;
   state.brsLoaded = true;
   if (!state.currentSemester) {
@@ -445,13 +427,65 @@ async function loadBrs(force = false) {
 
 function renderBrsPage() {
   const el = document.getElementById("page-brs");
-  if (!state.brsLoaded) {
-    el.innerHTML = `<div class="page-header">Оценки</div>${skelSubjectCards(5)}`;
-  }
+  if (state.brsSetupMode) { renderBrsSetup(el); return; }
+  if (!state.brsLoaded) el.innerHTML = `<div class="page-header">Оценки</div>${skelSubjectCards(5)}`;
   loadBrs().then(() => renderBrsView(el)).catch(e => {
-    el.innerHTML = `<div class="page-header">Оценки</div>
-      <div class="empty-state"><div class="empty-icon">❌</div><div class="empty-text">${e.message}</div></div>`;
+    if (e.message.includes("BRS credentials not configured")) {
+      state.brsSetupMode = true;
+      renderBrsSetup(el);
+    } else {
+      el.innerHTML = `<div class="page-header">Оценки</div>
+        <div class="empty-state"><div class="empty-icon">❌</div><div class="empty-text">${e.message}</div></div>
+        <button class="btn" onclick="state.brsSetupMode=true;renderBrsPage()">Настроить БРС</button>`;
+    }
   });
+}
+
+function renderBrsSetup(el) {
+  el.innerHTML = `
+    <div class="page-header">Настройка БРС</div>
+    <div class="card">
+      <div class="card-title">Введите данные от cs.vsu.ru</div>
+      <div class="form-group">
+        <label class="form-label">Логин</label>
+        <input class="form-input" id="brs-user" type="text" placeholder="ivanov_i_i">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Пароль</label>
+        <input class="form-input" id="brs-pass" type="password" placeholder="••••••••">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Student ID (из URL БРС)</label>
+        <input class="form-input" id="brs-id" type="text" placeholder="12345">
+      </div>
+      <div style="font-size:12px;color:var(--hint);margin-top:8px">Эти данные нужны только для получения твоих оценок.</div>
+    </div>
+    <button class="btn" onclick="saveBrsCreds()">Сохранить и войти</button>
+    ${state.brsLoaded ? `<button class="btn btn-secondary" style="margin-top:8px" onclick="state.brsSetupMode=false;renderBrsPage()">Назад</button>` : ''}`;
+}
+
+async function saveBrsCreds() {
+  const u = document.getElementById("brs-user").value.trim();
+  const p = document.getElementById("brs-pass").value.trim();
+  const s = document.getElementById("brs-id").value.trim();
+  if (!u || !p || !s) return;
+  haptic("medium");
+  const el = document.getElementById("page-brs");
+  el.innerHTML = `<div class="page-header">Оценки</div><div class="loader"><div class="spinner"></div>Проверка данных...</div>`;
+  try {
+    await apiFetch(`/api/brs/credentials/${userId}`, {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ username: u, password: p, student_id: s }),
+    });
+    state.brsSetupMode = false;
+    state.brsLoaded = false;
+    renderBrsPage();
+  } catch(e) {
+    state.brsSetupMode = true;
+    renderBrsSetup(el);
+    alert("Ошибка: " + e.message);
+  }
 }
 
 function renderBrsView(el) {
@@ -459,7 +493,8 @@ function renderBrsView(el) {
   const semesters = [...new Set(rows.map(r => r.semester))].sort((a,b) => b-a);
   if (!semesters.length) {
     el.innerHTML = `<div class="page-header">Оценки</div>
-      <div class="empty-state"><div class="empty-icon">📭</div><div class="empty-text">Нет данных</div></div>`;
+      <div class="empty-state"><div class="empty-icon">📭</div><div class="empty-text">Нет данных</div></div>
+      <button class="btn btn-secondary" onclick="state.brsSetupMode=true;renderBrsPage()">Изменить данные БРС</button>`;
     return;
   }
   const semTabs = semesters.map(s =>
@@ -484,19 +519,19 @@ function renderBrsView(el) {
         </div>
         ${r.attendance_pct != null ? `
           <div class="att-bar-row">
-            <div class="att-bar-wrap"><div class="att-bar ${barClass}" style="width:${Math.min(100,pct)}%"></div></div>
+            <div class="att-bar ${barClass}" style="width:${Math.min(100,pct)}%"></div></div>
             <span class="att-pct-label">${pct}%</span>
           </div>` : ""}
       </div>`;
   }).join("");
   el.innerHTML = `<div class="page-header">Оценки</div>
     <div class="semester-tabs">${semTabs}</div>
-    ${subjects}`;
+    ${subjects}
+    <button class="btn btn-secondary" style="margin-top:16px" onclick="state.brsSetupMode=true;renderBrsPage()">⚙️ Настройки БРС</button>`;
 }
 
 function switchSemester(s) { haptic("light"); state.currentSemester = s; renderBrsView(document.getElementById("page-brs")); }
 
-// ─── CALC ─────────────────────────────────────────────────────────────────────
 function renderCalcPage() {
   const el = document.getElementById("page-calc");
   if (!state.brsLoaded) {
@@ -582,14 +617,12 @@ async function selectCalcSubject(i) {
   state.calcSubjectIdx = i;
   renderCalcForm();
   const row = state.brs[i];
-  if (!row?.lessons_url) return;
+  if (!row?.lessons_url || !userId) return;
   try {
-    const stats = await apiFetch(`/api/brs/lessons?lessons_url=${encodeURIComponent(row.lessons_url)}`);
+    const stats = await apiFetch(`/api/brs/lessons?telegram_id=${userId}&lessons_url=${encodeURIComponent(row.lessons_url)}`);
     const heldEl   = document.getElementById("inp-held");
-    const futureEl = document.getElementById("inp-future");
     if (heldEl && stats.total > 0) {
       heldEl.value = stats.total;
-      if (futureEl) futureEl.value = estimateSemesterProgress().future;
       const hint = document.getElementById("lessons-hint");
       if (hint) hint.textContent = `Данные из БРС: ${stats.attended} из ${stats.total} посещено`;
     }
@@ -644,22 +677,18 @@ function showCalcResult(res, subject, skips) {
   if (change < 0) haptic("warning");
 }
 
-// ─── PROFILE ──────────────────────────────────────────────────────────────────
 const profileSetup = { step: null, course: null, group: null };
 
 async function renderProfilePage() {
   const el = document.getElementById("page-profile");
   if (profileSetup.step) { renderProfileSetup(el); return; }
-
   el.innerHTML = `<div class="page-header">Профиль</div><div class="loader"><div class="spinner"></div></div>`;
-
   if (userId) {
     [state.profile, state.reminderSettings] = await Promise.all([
       apiFetch(`/api/profile/${userId}`).catch(() => null),
       apiFetch(`/api/reminders/${userId}`).catch(() => ({ enabled: false, minutes_before: 15 })),
     ]);
   }
-
   if (state.profile) {
     const subLabel = ["Вся группа","1 подгруппа","2 подгруппа"][state.profile.subgroup] ?? "—";
     const rs = state.reminderSettings;
@@ -672,7 +701,6 @@ async function renderProfilePage() {
           `).join('')}
         </div>
       </div>` : '';
-
     el.innerHTML = `
       <div class="page-header">${userName ? escapeHtml(userName) : 'Профиль'}</div>
       <div class="profile-info">
@@ -681,7 +709,6 @@ async function renderProfilePage() {
         <div class="profile-row"><span class="profile-key">Подгруппа</span><span class="profile-val">${subLabel}</span></div>
       </div>
       <button class="btn btn-secondary" onclick="startProfileSetup()">✏️ Изменить профиль</button>
-
       <div class="home-section-title" style="margin-top:24px">⏰ Напоминания</div>
       <div class="toggle-row">
         <div>
@@ -691,7 +718,6 @@ async function renderProfilePage() {
         <div class="toggle ${rs.enabled?'on':''}" id="reminder-toggle" onclick="toggleReminder()"></div>
       </div>
       <div id="mins-section">${minsRow}</div>
-
       <div class="divider" style="margin:24px 0 16px"></div>
       <div class="home-section-title" style="margin-top:0">❓ FAQ</div>
       <div id="faq-container">${skelSubjectCards(3)}</div>`;
@@ -705,7 +731,6 @@ async function renderProfilePage() {
   }
 }
 
-// ─── REMINDERS UI ────────────────────────────────────────────────────────────
 async function toggleReminder() {
   if (!userId) return;
   haptic("medium");
@@ -717,7 +742,6 @@ async function toggleReminder() {
     headers: {"Content-Type":"application/json"},
     body: JSON.stringify(state.reminderSettings),
   }).catch(() => {});
-  // show/hide minutes section
   const sec = document.getElementById("mins-section");
   if (sec) {
     const rs = state.reminderSettings;
@@ -747,7 +771,6 @@ async function setReminderMinutes(mins) {
   }).catch(() => {});
 }
 
-// ─── FAQ ─────────────────────────────────────────────────────────────────────
 async function renderFaqInProfile() {
   const container = document.getElementById("faq-container");
   if (!container) return;
@@ -771,7 +794,6 @@ async function renderFaqInProfile() {
 
 function toggleFaq(i) { document.getElementById(`faq-${i}`)?.classList.toggle("open"); }
 
-// ─── PROFILE SETUP ────────────────────────────────────────────────────────────
 async function startProfileSetup() {
   profileSetup.step = "course";
   profileSetup.course = null;
@@ -784,20 +806,14 @@ async function startProfileSetup() {
 
 function renderProfileSetup(el) {
   if (profileSetup.step === "course") {
-    const courses = Object.keys(state.availableGroups).length
-      ? Object.keys(state.availableGroups).map(Number).sort()
-      : [1,2,3,4,5];
+    const courses = Object.keys(state.availableGroups).length ? Object.keys(state.availableGroups).map(Number).sort() : [1,2,3,4,5];
     el.innerHTML = `<div class="page-header">Курс</div>
-      <div class="select-grid">${courses.map(c =>
-        `<div class="select-option ${profileSetup.course===c?'active':''}" onclick="selectCourse(${c})">${c} курс</div>`
-      ).join("")}</div>`;
+      <div class="select-grid">${courses.map(c => `<div class="select-option ${profileSetup.course===c?'active':''}" onclick="selectCourse(${c})">${c} курс</div>`).join("")}</div>`;
   } else if (profileSetup.step === "group") {
     const groups = (state.availableGroups[String(profileSetup.course)] || []).sort((a,b)=>a-b);
     const list = groups.length ? groups : Array.from({length:20},(_,i)=>i+1);
     el.innerHTML = `<div class="page-header">${profileSetup.course} курс — Группа</div>
-      <div class="select-grid">${list.map(g =>
-        `<div class="select-option ${profileSetup.group===g?'active':''}" onclick="selectGroup(${g})">${g}</div>`
-      ).join("")}</div>
+      <div class="select-grid">${list.map(g => `<div class="select-option ${profileSetup.group===g?'active':''}" onclick="selectGroup(${g})">${g}</div>`).join("")}</div>
       <button class="btn btn-secondary" style="margin-top:8px" onclick="profileSetup.step='course';renderProfileSetup(document.getElementById('page-profile'))">← Назад</button>`;
   } else if (profileSetup.step === "subgroup") {
     el.innerHTML = `<div class="page-header">Подгруппа</div>
@@ -812,8 +828,8 @@ function renderProfileSetup(el) {
   }
 }
 
-function selectCourse(c) { haptic("light"); profileSetup.course=c; profileSetup.step="group";    renderProfileSetup(document.getElementById("page-profile")); }
-function selectGroup(g)  { haptic("light"); profileSetup.group=g;  profileSetup.step="subgroup"; renderProfileSetup(document.getElementById("page-profile")); }
+function selectCourse(c) { haptic("light"); profileSetup.course=c; profileSetup.step="group"; renderProfileSetup(document.getElementById("page-profile")); }
+function selectGroup(g)  { haptic("light"); profileSetup.group=g; profileSetup.step="subgroup"; renderProfileSetup(document.getElementById("page-profile")); }
 
 async function selectSubgroup(s) {
   haptic("medium");
@@ -832,16 +848,14 @@ async function selectSubgroup(s) {
   renderProfilePage();
 }
 
-// ─── Boot ────────────────────────────────────────────────────────────────────
 async function boot() {
   if (userId) {
     try {
       state.profile = await apiFetch(`/api/profile/${userId}`);
     } catch(e) {
       if (e.message === "Profile not found") {
-        state.profile = null; // реально не настроен
+        state.profile = null;
       } else {
-        // сетевая ошибка / сервер только стартанул — ждём и пробуем ещё раз
         await new Promise(r => setTimeout(r, 2000));
         state.profile = await apiFetch(`/api/profile/${userId}`).catch(() => null);
       }

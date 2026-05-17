@@ -12,3 +12,8 @@ python-dotenv==1.2.2
 requests==2.32.5
 SQLAlchemy==2.0.47
 uvicorn==0.42.0
+ruff
+mypy
+pytest
+pytest-asyncio
+httpx

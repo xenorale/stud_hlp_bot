@@ -2,19 +2,14 @@ from typing import Optional
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from database.models import Base, User, ReminderSettings
+from utils.security import encrypt, decrypt
+
 engine = create_async_engine('sqlite+aiosqlite:///bot.db', connect_args={'check_same_thread': False})
 SessionLocal = async_sessionmaker(bind=engine, autocommit=False, autoflush=False, class_=AsyncSession)
 
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    async with engine.connect() as conn:
-        for col, typedef in [('course_number', 'INTEGER'), ('group_number', 'INTEGER'), ('subgroup_number', 'INTEGER'), ('brs_username', 'VARCHAR'), ('brs_password', 'VARCHAR'), ('brs_cookies', 'VARCHAR')]:
-            try:
-                await conn.execute(text(f'ALTER TABLE users ADD COLUMN {col} {typedef}'))
-                await conn.commit()
-            except Exception:
-                pass
 
 async def get_user_profile(telegram_id: int) -> Optional[dict]:
     async with SessionLocal() as session:
@@ -22,7 +17,14 @@ async def get_user_profile(telegram_id: int) -> Optional[dict]:
         user = result.scalar_one_or_none()
         if not user or user.course_number is None or user.group_number is None:
             return None
-        return {'course': user.course_number, 'group': user.group_number, 'subgroup': user.subgroup_number or 0, 'brs_username': user.brs_username, 'brs_password': user.brs_password, 'student_id': user.student_id}
+        return {
+            'course': user.course_number, 
+            'group': user.group_number, 
+            'subgroup': user.subgroup_number or 0, 
+            'brs_username': user.brs_username, 
+            'brs_password': decrypt(user.brs_password) if user.brs_password else None, 
+            'student_id': user.student_id
+        }
 
 async def save_user_profile(telegram_id: int, course: int, group: int, subgroup: int=0) -> None:
     async with SessionLocal() as session:
@@ -41,12 +43,13 @@ async def save_brs_credentials(telegram_id: int, username: str, password: str, s
     async with SessionLocal() as session:
         result = await session.execute(select(User).filter_by(telegram_id=telegram_id))
         user = result.scalar_one_or_none()
+        encrypted_pass = encrypt(password)
         if user:
             user.brs_username = username
-            user.brs_password = password
+            user.brs_password = encrypted_pass
             user.student_id = student_id
         else:
-            user = User(telegram_id=telegram_id, brs_username=username, brs_password=password, student_id=student_id)
+            user = User(telegram_id=telegram_id, brs_username=username, brs_password=encrypted_pass, student_id=student_id)
             session.add(user)
         await session.commit()
 
@@ -73,7 +76,7 @@ async def save_reminder_settings(telegram_id: int, enabled: bool, minutes_before
 async def get_all_brs_users() -> list:
     async with SessionLocal() as session:
         result = await session.execute(text('SELECT telegram_id, brs_username, brs_password, student_id FROM users WHERE brs_username IS NOT NULL AND brs_password IS NOT NULL'))
-        return [{'telegram_id': row[0], 'brs_username': row[1], 'brs_password': row[2], 'student_id': row[3]} for row in result.all()]
+        return [{'telegram_id': row[0], 'brs_username': row[1], 'brs_password': decrypt(row[2]), 'student_id': row[3]} for row in result.all()]
 
 async def get_reminder_users() -> list:
     async with SessionLocal() as session:
@@ -91,9 +94,7 @@ async def get_brs_cookies(telegram_id: int) -> Optional[str]:
     async with SessionLocal() as session:
         result = await session.execute(select(User).filter_by(telegram_id=telegram_id))
         user = result.scalar_one_or_none()
-        if user and user.brs_cookies:
-            return user.brs_cookies
-        return None
+        return user.brs_cookies if user and user.brs_cookies else None
 
 async def save_brs_cookies(telegram_id: int, cookies_json: str) -> None:
     async with SessionLocal() as session:

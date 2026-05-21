@@ -1,8 +1,12 @@
 from __future__ import annotations
+import logging
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 from bs4 import BeautifulSoup
 import httpx
+
+logger = logging.getLogger(__name__)
+
 REQUEST_TIMEOUT = 25
 MAX_RETRIES = 3
 
@@ -58,23 +62,23 @@ async def _safe_request(client: httpx.AsyncClient, method: str, url: str, **kwar
 
 async def brs_login(username: str, password: str, cookies: Optional[dict]=None) -> Tuple[httpx.AsyncClient, dict]:
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'}
-    client = httpx.AsyncClient(verify=False, headers=headers)
+    client = httpx.AsyncClient(verify=False, headers=headers, follow_redirects=True)
     if cookies:
         client.cookies.update(cookies)
     base = 'https://www.cs.vsu.ru'
     login_url = f'{base}/brs/login'
+    
     if cookies:
         try:
-            resp = await _safe_request(client, 'GET', login_url, follow_redirects=True)
+            resp = await _safe_request(client, 'GET', login_url)
             if 'Выход' in resp.text or 'logout' in resp.text.lower():
                 return (client, dict(client.cookies))
         except Exception:
             pass
         client.cookies.clear()
-    client.headers['Referer'] = login_url
-    await _safe_request(client, 'GET', login_url)
+        
     payload = {'login': username, 'password': password, 'button_login': 'Вход'}
-    resp = await _safe_request(client, 'POST', login_url, data=payload, follow_redirects=True)
+    resp = await _safe_request(client, 'POST', login_url, data=payload)
     if 'Выход' not in resp.text and 'logout' not in resp.text.lower():
         from bs4 import BeautifulSoup as _BS
         _soup = _BS(resp.text, 'lxml')
@@ -153,13 +157,26 @@ async def fetch_lessons_stats(lessons_url: str, client: httpx.AsyncClient) -> Le
     return parse_lessons_html(resp.text)
 
 async def fetch_and_parse_brs(student_id: str, username: str, password: str, cookies: Optional[dict]=None) -> Tuple[List[BrsRow], dict]:
-    client, valid_cookies = await brs_login(username, password, cookies)
+    logger.info(f'BRS: Начинаю сессию для {username}')
     try:
+        client, valid_cookies = await brs_login(username, password, cookies)
+    except Exception as e:
+        logger.error(f'BRS: Ошибка авторизации: {e}')
+        raise
+    
+    try:
+        logger.info(f'BRS: Загружаю отчет для {student_id}')
         html = await fetch_brs_html(student_id, client)
+        logger.info('BRS: Парсю данные')
         rows = parse_brs_att_marks(html)
+        logger.info(f'BRS: Успешно загружено {len(rows)} строк')
         return (rows, valid_cookies)
+    except Exception as e:
+        logger.error(f'BRS: Ошибка при получении/парсинге: {e}')
+        raise
     finally:
         await client.aclose()
+        logger.info('BRS: Клиент закрыт')
 
 def rows_to_pretty_text(rows: List[BrsRow], limit: int=15) -> str:
     lines: list[str] = []

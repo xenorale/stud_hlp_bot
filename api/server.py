@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import sys
+import asyncio
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,10 +14,14 @@ from database.db import get_user_profile, save_user_profile, get_reminder_settin
 from utils.brs_parser import brs_login, fetch_lessons_stats, fetch_and_parse_brs
 from utils.calculators import get_attendance_penalty, simulate_attendance_change, grade_by_percentage
 from utils.schedule_parser import parse_group_schedule, fetch_sheet_rows, get_available_groups
+
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 app = FastAPI(title='Student Helper API')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
 BRS_CACHE: dict = {}
+BRS_LOCKS: dict = {}
 BRS_TTL = 3600
 SCHEDULE_CACHE: dict = {}
 SCHEDULE_TTL = 86400
@@ -110,25 +115,67 @@ async def api_get_brs(telegram_id: int):
     profile = await get_user_profile(telegram_id)
     if not profile or not profile.get('brs_username') or (not profile.get('brs_password')) or (not profile.get('student_id')):
         raise HTTPException(status_code=503, detail='BRS credentials not configured for user')
+
     now = datetime.now().timestamp()
-    if telegram_id in BRS_CACHE and BRS_CACHE[telegram_id]['data'] and (now - BRS_CACHE[telegram_id]['timestamp'] < BRS_TTL):
+    
+    # 1. Если есть в кэше, сразу возвращаем (даже если старое)
+    if telegram_id in BRS_CACHE and BRS_CACHE[telegram_id].get('data'):
+        # Если данные свежие, просто возвращаем
+        if now - BRS_CACHE[telegram_id]['timestamp'] < BRS_TTL:
+            return BRS_CACHE[telegram_id]['data']
+        # Если старые, возвращаем их и запускаем обновление в фоне
+        asyncio.create_task(_refresh_brs_data(telegram_id, profile))
         return BRS_CACHE[telegram_id]['data']
+
+    # 2. Если данных в кэше нет совсем, ждем их загрузки (вынужденная блокировка)
+    if telegram_id not in BRS_LOCKS:
+        BRS_LOCKS[telegram_id] = asyncio.Lock()
+    
+    async with BRS_LOCKS[telegram_id]:
+        # Повторная проверка внутри лока (вдруг кто-то уже загрузил)
+        if telegram_id in BRS_CACHE and BRS_CACHE[telegram_id].get('data'):
+            return BRS_CACHE[telegram_id]['data']
+            
+        data = await _fetch_brs_sync(telegram_id, profile)
+        return data
+
+async def _refresh_brs_data(telegram_id: int, profile: dict):
+    if telegram_id not in BRS_LOCKS:
+        BRS_LOCKS[telegram_id] = asyncio.Lock()
+    if BRS_LOCKS[telegram_id].locked():
+        return
+    async with BRS_LOCKS[telegram_id]:
+        await _fetch_brs_sync(telegram_id, profile)
+
+async def _fetch_brs_sync(telegram_id: int, profile: dict):
     cookies_json = await get_brs_cookies(telegram_id)
     cookies_dict = json.loads(cookies_json) if cookies_json else None
-    try:
-        rows, new_cookies = await fetch_and_parse_brs(profile['student_id'], profile['brs_username'], profile['brs_password'], cookies_dict)
-        if new_cookies:
-            await save_brs_cookies(telegram_id, json.dumps(new_cookies))
-    except Exception as e:
-        logger.error(f'Failed to load BRS data: {e}')
-        raise HTTPException(status_code=502, detail='Failed to load BRS data')
+    
+    rows, new_cookies = await fetch_and_parse_brs(
+        profile['student_id'], 
+        profile['brs_username'], 
+        profile['brs_password'], 
+        cookies_dict
+    )
+    if new_cookies:
+        await save_brs_cookies(telegram_id, json.dumps(new_cookies))
+        
     if not rows:
         raise HTTPException(status_code=502, detail='Failed to load BRS data')
+        
     result = []
     for row in rows:
         penalty = get_attendance_penalty(row.weighted_score)
-        result.append({'subject': row.subject, 'semester': row.semester, 'control': row.control, 'teacher': row.teacher_short, 'att1': row.att1, 'att2': row.att2, 'att3': row.att3, 'attendance_pct': row.attendance_pct, 'weighted_score': row.weighted_score, 'exam_score': row.exam_score, 'final_score': row.final_score, 'final_text': row.final_text, 'grade_icon': penalty['grade'], 'grade_desc': penalty['description'], 'lessons_url': row.lessons_url})
-    BRS_CACHE[telegram_id] = {'data': result, 'timestamp': now}
+        result.append({
+            'subject': row.subject, 'semester': row.semester, 'control': row.control, 
+            'teacher': row.teacher_short, 'att1': row.att1, 'att2': row.att2, 
+            'att3': row.att3, 'attendance_pct': row.attendance_pct, 
+            'weighted_score': row.weighted_score, 'exam_score': row.exam_score, 
+            'final_score': row.final_score, 'final_text': row.final_text, 
+            'grade_icon': penalty['grade'], 'grade_desc': penalty['description'], 
+            'lessons_url': row.lessons_url
+        })
+    BRS_CACHE[telegram_id] = {'data': result, 'timestamp': datetime.now().timestamp()}
     return result
 LESSONS_CACHE: dict = {}
 LESSONS_TTL = 3600

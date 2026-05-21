@@ -1,4 +1,4 @@
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 import os
 from dotenv import load_dotenv
 
@@ -16,4 +16,7 @@ def encrypt(data: str) -> str:
     return cipher.encrypt(data.encode()).decode()
 
 def decrypt(data: str) -> str:
-    return cipher.decrypt(data.encode()).decode()
+    try:
+        return cipher.decrypt(data.encode()).decode()
+    except (InvalidToken, ValueError):
+        return data
